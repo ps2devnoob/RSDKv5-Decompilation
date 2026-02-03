@@ -248,6 +248,8 @@ private:
 #include "DX11/DX11RenderDevice.hpp"
 #elif RETRO_RENDERDEVICE_SDL2
 #include "SDL2/SDL2RenderDevice.hpp"
+#elif RETRO_RENDERDEVICE_PS2
+#include "PS2/PS2RenderDevice.hpp"
 #elif RETRO_RENDERDEVICE_GLFW
 #include "GLFW/GLFWRenderDevice.hpp"
 #elif RETRO_RENDERDEVICE_VK

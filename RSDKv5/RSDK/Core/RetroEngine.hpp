@@ -85,6 +85,7 @@ enum GameRegions {
 #define RETRO_PS4    (1)
 #define RETRO_XB1    (2)
 #define RETRO_SWITCH (3)
+#define RETRO_PS2    (9)
 // CUSTOM
 #define RETRO_OSX     (4)
 #define RETRO_LINUX   (5)
@@ -139,6 +140,9 @@ enum GameRegions {
 #elif defined __SWITCH__
 #define RETRO_PLATFORM   (RETRO_SWITCH)
 #define RETRO_DEVICETYPE (RETRO_STANDARD)
+#elif defined __PS2__
+#define RETRO_PLATFORM   (RETRO_PS2)
+#define RETRO_DEVICETYPE (RETRO_STANDARD)
 #elif defined __linux__
 #define RETRO_PLATFORM   (RETRO_LINUX)
 #define RETRO_DEVICETYPE (RETRO_STANDARD)
@@ -176,6 +180,9 @@ enum GameRegions {
 #ifndef RETRO_AUDIODEVICE_SDL2
 #define RETRO_AUDIODEVICE_SDL2 (0)
 #endif
+#ifndef RETRO_AUDIODEVICE_PS2
+#define RETRO_AUDIODEVICE_PS2 (1)
+#endif
 #define RETRO_AUDIODEVICE_OBOE (0)
 #ifndef RETRO_AUDIODEVICE_PORT
 #define RETRO_AUDIODEVICE_PORT (0)
@@ -196,6 +203,7 @@ enum GameRegions {
 #define RETRO_INPUTDEVICE_SDL2   (0)
 #define RETRO_INPUTDEVICE_GLFW   (0)
 #define RETRO_INPUTDEVICE_PDBOAT (0)
+#define RETRO_INPUTDEVICE_PS2 (1)
 
 // ============================
 // USER CORE BACKENDS
@@ -215,7 +223,7 @@ enum GameRegions {
 
 // Determines if the engine is RSDKv5 rev01 (all versions of mania pre-plus), rev02 (all versions of mania post-plus) or RSDKv5U (sonic origins)
 #ifndef RETRO_REVISION
-#define RETRO_REVISION (3)
+#define RETRO_REVISION (2)
 #endif
 
 // RSDKv5 Rev02 (Used prior to Sonic Mania Plus)
@@ -393,6 +401,28 @@ enum GameRegions {
 #define RETRO_INPUTDEVICE_KEYBOARD (0)
 #undef RETRO_USING_MOUSE
 
+#elif RETRO_PLATFORM == RETRO_PS2
+
+#ifdef RSDK_USE_PS2
+#undef RETRO_RENDERDEVICE_SDL2
+#define RETRO_RENDERDEVICE_SDL2 (0)
+#undef RETRO_AUDIODEVICE_SDL2
+#define RETRO_AUDIODEVICE_SDL2 (0)
+
+#undef RETRO_AUDIODEVICE_PS2
+#define RETRO_AUDIODEVICE_PS2 (1)
+
+#undef RETRO_INPUTDEVICE_PS2
+#define RETRO_INPUTDEVICE_PS2 (1)
+
+#else
+#error RSDK_USE_SDL2 must be defined for PS2.
+#endif
+
+#undef RETRO_INPUTDEVICE_KEYBOARD
+#define RETRO_INPUTDEVICE_KEYBOARD (0)
+#undef RETRO_USING_MOUSE
+
 #elif RETRO_PLATFORM == RETRO_ANDROID
 
 #if defined RSDK_USE_OGL
@@ -514,6 +544,16 @@ extern "C" {
 #include <dyn.h>
 }
 #undef PrintConsole
+#endif
+
+#elif RETRO_PLATFORM == RETRO_PS2
+
+#if RETRO_AUDIODEVICE_MINI
+#define MA_NO_DECODING
+#define MA_NO_ENCODING
+#define MA_NO_RESOURCE_MANAGER 
+#define MA_NO_ENGINE
+#include <miniaudio/miniaudio.h>
 #endif
 
 #elif RETRO_PLATFORM == RETRO_ANDROID

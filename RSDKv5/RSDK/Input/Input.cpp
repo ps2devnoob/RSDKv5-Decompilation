@@ -8,6 +8,7 @@ int32 RSDK::inputDeviceCount = 0;
 int32 RSDK::inputSlots[PLAYER_COUNT]              = { INPUT_NONE, INPUT_NONE, INPUT_NONE, INPUT_NONE };
 InputDevice *RSDK::inputSlotDevices[PLAYER_COUNT] = { NULL, NULL, NULL, NULL };
 
+
 ControllerState RSDK::controller[PLAYER_COUNT + 1];
 AnalogState RSDK::stickL[PLAYER_COUNT + 1];
 #if RETRO_REV02
@@ -16,6 +17,7 @@ TriggerState RSDK::triggerL[PLAYER_COUNT + 1];
 TriggerState RSDK::triggerR[PLAYER_COUNT + 1];
 #endif
 TouchInfo RSDK::touchInfo;
+
 
 GamePadMappings *RSDK::gamePadMappings = NULL;
 int32 RSDK::gamePadCount               = 0;
@@ -52,6 +54,10 @@ int32 RSDK::gamePadCount               = 0;
 #include "Paddleboat/PDBInputDevice.cpp"
 #endif
 
+#if RETRO_INPUTDEVICE_PS2
+#include "PS2/PS2InputDevice.cpp"
+#endif
+
 void RSDK::RemoveInputDevice(InputDevice *targetDevice)
 {
     if (targetDevice) {
@@ -65,7 +71,7 @@ void RSDK::RemoveInputDevice(InputDevice *targetDevice)
                 inputDeviceList[d] = NULL;
 
                 for (int32 id = d + 1; id <= inputDeviceCount && id < INPUTDEVICE_COUNT; ++id) inputDeviceList[id - 1] = inputDeviceList[id];
-                // clear end device duplicate, prevents issues with new devices deleting stuff they shouldn't be
+                
                 if (inputDeviceCount < INPUTDEVICE_COUNT)
                     inputDeviceList[inputDeviceCount] = NULL;
 
@@ -94,9 +100,9 @@ void RSDK::RemoveInputDevice(InputDevice *targetDevice)
 void RSDK::InitInputDevices()
 {
 #if !RETRO_USE_ORIGINAL_CODE
-    // default the input slot state to "auto assign" rather than "none"
-    // this fixes the "controller disconnected" popup since the engine handles the autoassign
-    // without this, the engine has to wait for the game to tell the engine to start autoassignments
+    
+    
+    
     for (int32 i = 0; i < PLAYER_COUNT; ++i) inputSlots[i] = INPUT_AUTOASSIGN;
 #endif
 
@@ -131,7 +137,14 @@ void RSDK::InitInputDevices()
 #if RETRO_INPUTDEVICE_PDBOAT
     SKU::InitPaddleboatInputAPI();
 #endif
+
+#if RETRO_INPUTDEVICE_PS2
+    SKU::InitPS2InputAPI();
+#endif
 }
+
+
+
 
 void RSDK::ReleaseInputDevices()
 {
@@ -140,8 +153,54 @@ void RSDK::ReleaseInputDevices()
 #endif
 }
 
+
+
+void RSDK::ProcessInput()
+{
+    
+    bool32 anyPress = false;
+    for (int32 i = 0; i < inputDeviceCount; ++i) {
+        if (inputDeviceList[i]) {
+            inputDeviceList[i]->UpdateInput();
+            anyPress |= inputDeviceList[i]->anyPress;
+        }
+    }
+
+#if RETRO_REV02
+    if (anyPress || touchInfo.count)
+        videoSettings.dimTimer = 0;
+    else if (videoSettings.dimTimer < videoSettings.dimLimit)
+        ++videoSettings.dimTimer;
+#endif
+    
+    for (int32 i = 0; i < PLAYER_COUNT; ++i) {
+        int32 assign = inputSlots[i];
+        if (assign && assign != INPUT_UNASSIGNED) {
+            if (assign == INPUT_AUTOASSIGN) {
+                int32 id = GetAvaliableInputDevice();
+                inputSlots[i] = id;
+                if (id != INPUT_AUTOASSIGN)
+                    AssignInputSlotToDevice(CONT_P1 + i, id);
+            }
+            else {
+                InputDevice *device = inputSlotDevices[i];
+                if (device && device->id == assign && device->active)
+                    device->ProcessInput(CONT_P1 + i);
+            }
+        }
+    }
+
+#if !RETRO_REV02 && RETRO_INPUTDEVICE_KEYBOARD
+    RSDK::SKU::HandleSpecialKeys();
+#endif
+
+    
+    
+}
+
 void RSDK::ClearInput()
 {
+    
     for (int32 i = 0; i <= PLAYER_COUNT; ++i) {
         if (i != 0 && inputSlots[i - 1] == INPUT_UNASSIGNED)
             continue;
@@ -191,124 +250,7 @@ void RSDK::ClearInput()
     }
 }
 
-void RSDK::ProcessInput()
-{
-    ClearInput();
 
-    bool32 anyPress = false;
-    for (int32 i = 0; i < inputDeviceCount; ++i) {
-        if (inputDeviceList[i]) {
-            inputDeviceList[i]->UpdateInput();
-
-            anyPress |= inputDeviceList[i]->anyPress;
-        }
-    }
-
-#if RETRO_REV02
-    if (anyPress || touchInfo.count)
-        videoSettings.dimTimer = 0;
-    else if (videoSettings.dimTimer < videoSettings.dimLimit)
-        ++videoSettings.dimTimer;
-#endif
-
-    for (int32 i = 0; i < PLAYER_COUNT; ++i) {
-        int32 assign = inputSlots[i];
-        if (assign && assign != INPUT_UNASSIGNED) {
-            if (assign == INPUT_AUTOASSIGN) {
-                int32 id      = GetAvaliableInputDevice();
-                inputSlots[i] = id;
-                if (id != INPUT_AUTOASSIGN)
-                    AssignInputSlotToDevice(CONT_P1 + i, id);
-            }
-            else {
-                InputDevice *device = inputSlotDevices[i];
-                if (device && device->id == assign && device->active)
-                    device->ProcessInput(CONT_P1 + i);
-            }
-        }
-    }
-
-#if !RETRO_REV02 && RETRO_INPUTDEVICE_KEYBOARD
-    RSDK::SKU::HandleSpecialKeys();
-#endif
-
-    for (int32 c = 0; c <= PLAYER_COUNT; ++c) {
-        if (c <= 0 || inputSlots[c - 1] != INPUT_UNASSIGNED) {
-            InputState *cont[] = {
-                &controller[c].keyUp, &controller[c].keyDown, &controller[c].keyLeft,  &controller[c].keyRight,
-                &controller[c].keyA,  &controller[c].keyB,    &controller[c].keyC,     &controller[c].keyX,
-                &controller[c].keyY,  &controller[c].keyZ,    &controller[c].keyStart, &controller[c].keySelect,
-            };
-
-#if RETRO_REV02
-            InputState *lStick[] = { &stickL[c].keyUp, &stickL[c].keyDown, &stickL[c].keyLeft, &stickL[c].keyRight, &stickL[c].keyStick };
-            InputState *rStick[] = { &stickR[c].keyUp, &stickR[c].keyDown, &stickR[c].keyLeft, &stickR[c].keyRight, &stickR[c].keyStick };
-
-            InputState *lTrigger[] = { &triggerL[c].keyBumper, &triggerL[c].keyTrigger };
-            InputState *rTrigger[] = { &triggerR[c].keyBumper, &triggerR[c].keyTrigger };
-#else
-            InputState *lStick[] = { &stickL[c].keyUp, &stickL[c].keyDown, &stickL[c].keyLeft, &stickL[c].keyRight, &controller[c].keyStickL };
-            InputState *rStick[] = { NULL, NULL, NULL, NULL, &controller[c].keyStickR };
-
-            InputState *lTrigger[] = { &controller[c].keyBumperL, &controller[c].keyTriggerL };
-            InputState *rTrigger[] = { &controller[c].keyBumperR, &controller[c].keyTriggerR };
-#endif
-
-            for (int32 i = 0; i < 12; ++i) {
-                if (cont[i]->press) {
-                    if (cont[i]->down)
-                        cont[i]->press = false;
-                    else
-                        cont[i]->down = true;
-                }
-                else
-                    cont[i]->down = false;
-            }
-
-            for (int32 i = 0; i < 5; ++i) {
-                if (lStick[i]->press) {
-                    if (lStick[i]->down)
-                        lStick[i]->press = false;
-                    else
-                        lStick[i]->down = true;
-                }
-                else
-                    lStick[i]->down = false;
-
-                if (rStick[i]) {
-                    if (rStick[i]->press) {
-                        if (rStick[i]->down)
-                            rStick[i]->press = false;
-                        else
-                            rStick[i]->down = true;
-                    }
-                    else
-                        rStick[i]->down = false;
-                }
-            }
-
-            for (int32 i = 0; i < 2; ++i) {
-                if (lTrigger[i]->press) {
-                    if (lTrigger[i]->down)
-                        lTrigger[i]->press = false;
-                    else
-                        lTrigger[i]->down = true;
-                }
-                else
-                    lTrigger[i]->down = false;
-
-                if (rTrigger[i]->press) {
-                    if (rTrigger[i]->down)
-                        rTrigger[i]->press = false;
-                    else
-                        rTrigger[i]->down = true;
-                }
-                else
-                    rTrigger[i]->down = false;
-            }
-        }
-    }
-}
 
 void RSDK::ProcessInputDevices()
 {
@@ -348,3 +290,4 @@ int32 RSDK::GetInputDeviceType(uint32 deviceID)
     }
 #endif
 }
+

@@ -397,8 +397,13 @@ void LinkGameLogic(EngineInfo info);
 // ORIGINAL CLASS
 
 // Windows.h already included by master header
-#if !(RETRO_PLATFORM == RETRO_WIN || RETRO_PLATFORM == RETRO_SWITCH)
+#if !(RETRO_PLATFORM == RETRO_WIN || RETRO_PLATFORM == RETRO_SWITCH || RETRO_PLATFORM == RETRO_PS2)
 #include <dlfcn.h>
+#else
+#define dlopen(x, y) NULL
+#define dlclose(x) 
+#define dlsym(x, y) NULL
+#define dlerror() "Not supported"
 #endif
 
 // Only define this if you want to prioritize checking libraries first (Game_x64.dll then Game.dll)

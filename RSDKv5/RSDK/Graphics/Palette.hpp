@@ -23,7 +23,7 @@ extern uint16 stagePalette[PALETTE_BANK_COUNT][PALETTE_BANK_SIZE];
 
 extern uint16 fullPalette[PALETTE_BANK_COUNT][PALETTE_BANK_SIZE];
 
-extern uint8 gfxLineBuffer[SCREEN_YSIZE]; // Pointers to active palette
+extern uint8 gfxLineBuffer[SCREEN_YSIZE];
 
 extern int32 maskColor;
 
@@ -33,9 +33,8 @@ extern uint16 *tintLookupTable;
 extern uint16 tintLookupTable[0x10000];
 #endif
 
-#define RGB888_TO_RGB565(r, g, b) ((b) >> 3) | (((g) >> 2) << 5) | (((r) >> 3) << 11)
-
-#define PACK_RGB888(r, g, b) RGB888_TO_RGB565(r, g, b)
+#define RGB888_TO_BGR555(r, g, b) ((b) >> 3) | (((g) >> 3) << 5) | (((r) >> 3) << 10)
+#define PACK_RGB888(r, g, b) RGB888_TO_BGR555(r, g, b)
 
 #if RETRO_REV02
 void LoadPalette(uint8 bankID, const char *filePath, uint16 disabledRows);
@@ -44,30 +43,35 @@ void LoadPalette(uint8 bankID, const char *filePath, uint16 disabledRows);
 inline void SetActivePalette(uint8 newActiveBank, int32 startLine, int32 endLine)
 {
     if (newActiveBank < PALETTE_BANK_COUNT)
-        for (int32 l = startLine; l < endLine && l < SCREEN_YSIZE; l++) gfxLineBuffer[l] = newActiveBank;
+        for (int32 l = startLine; l < endLine && l < SCREEN_YSIZE; l++) 
+            gfxLineBuffer[l] = newActiveBank;
 }
 
 inline uint32 GetPaletteEntry(uint8 bankID, uint8 index)
 {
-    // 0xF800 = 1111 1000 0000 0000 = R
-    // 0x7E0  = 0000 0111 1110 0000 = G
-    // 0x1F   = 0000 0000 0001 1111 = B
     uint16 clr = fullPalette[bankID & 7][index];
 
-    int32 R = (clr & 0xF800) << 8;
-    int32 G = (clr & 0x7E0) << 5;
-    int32 B = (clr & 0x1F) << 3;
-    return R | G | B;
+    int32 B = (clr & 0x1F) << 3;         
+    int32 G = ((clr >> 5) & 0x1F) << 3;   
+    int32 R = ((clr >> 10) & 0x1F) << 3; 
+    
+    return (R << 16) | (G << 8) | B;
 }
 
 inline void SetPaletteEntry(uint8 bankID, uint8 index, uint32 color)
 {
-    fullPalette[bankID][index] = rgb32To16_B[(color >> 0) & 0xFF] | rgb32To16_G[(color >> 8) & 0xFF] | rgb32To16_R[(color >> 16) & 0xFF];
+    fullPalette[bankID][index] = 
+        ((color >> 0) & 0xFF) >> 3 |      
+        (((color >> 8) & 0xFF) >> 3) << 5 |
+        (((color >> 16) & 0xFF) >> 3) << 10;
 }
 
 inline void SetPaletteMask(uint32 color)
 {
-    maskColor = rgb32To16_B[(color >> 0) & 0xFF] | rgb32To16_G[(color >> 8) & 0xFF] | rgb32To16_R[(color >> 16) & 0xFF];
+    maskColor = 
+        ((color >> 0) & 0xFF) >> 3 |       
+        (((color >> 8) & 0xFF) >> 3) << 5 |
+        (((color >> 16) & 0xFF) >> 3) << 10;
 }
 
 #if RETRO_REV02
@@ -94,12 +98,14 @@ inline void RotatePalette(uint8 bankID, uint8 startIndex, uint8 endIndex, bool32
 {
     if (right) {
         uint16 startClr = fullPalette[bankID][endIndex];
-        for (int32 i = endIndex; i > startIndex; --i) fullPalette[bankID][i] = fullPalette[bankID][i - 1];
+        for (int32 i = endIndex; i > startIndex; --i) 
+            fullPalette[bankID][i] = fullPalette[bankID][i - 1];
         fullPalette[bankID][startIndex] = startClr;
     }
     else {
         uint16 startClr = fullPalette[bankID][startIndex];
-        for (int32 i = startIndex; i < endIndex; ++i) fullPalette[bankID][i] = fullPalette[bankID][i + 1];
+        for (int32 i = startIndex; i < endIndex; ++i) 
+            fullPalette[bankID][i] = fullPalette[bankID][i + 1];
         fullPalette[bankID][endIndex] = startClr;
     }
 }

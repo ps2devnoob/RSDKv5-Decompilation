@@ -204,7 +204,14 @@ void RSDK::LoadSceneFolder()
         for (int32 o = 0; o < sceneInfo.classCount; ++o) {
             ObjectClass *objClass = &objectClassList[stageObjectIDs[o]];
             if (objClass->staticVars && !*objClass->staticVars) {
-                AllocateStorage((void **)objClass->staticVars, objClass->staticClassSize, DATASET_STG, true);
+                if (!(*objClass->staticVars)) {
+#if RETRO_PLATFORM == RETRO_PS2
+    printf("[SCENE INIT] Objeto '%s' alocando staticVars: %u bytes (%.2f KB)\n",
+           objectClassList[o].name, objClass->staticClassSize, 
+           objClass->staticClassSize / 1024.0f);
+#endif
+    AllocateStorage((void **)objClass->staticVars, objClass->staticClassSize, DATASET_STG, true);
+}
 
 #if RETRO_REV0U
                 if (objClass->staticLoad)
@@ -237,22 +244,31 @@ void RSDK::LoadSceneFolder()
         }
 
         for (int32 p = 0; p < PALETTE_BANK_COUNT; ++p) {
-            activeStageRows[p] = ReadInt16(&info);
+    activeStageRows[p] = ReadInt16(&info);
 
-            for (int32 r = 0; r < 0x10; ++r) {
-                if ((activeStageRows[p] >> r & 1)) {
-                    for (int32 c = 0; c < 0x10; ++c) {
-                        uint8 red                     = ReadInt8(&info);
-                        uint8 green                   = ReadInt8(&info);
-                        uint8 blue                    = ReadInt8(&info);
-                        stagePalette[p][(r << 4) + c] = rgb32To16_B[blue] | rgb32To16_G[green] | rgb32To16_R[red];
-                    }
-                }
-                else {
-                    for (int32 c = 0; c < 0x10; ++c) stagePalette[p][(r << 4) + c] = 0;
-                }
+    for (int32 r = 0; r < 0x10; ++r) {
+        uint16 *dst = &stagePalette[p][r << 4];
+
+        if (activeStageRows[p] & (1 << r)) {
+            for (int32 c = 0; c < 0x10; ++c) {
+                uint8 red   = ReadInt8(&info);
+                uint8 green = ReadInt8(&info);
+                uint8 blue  = ReadInt8(&info);
+
+                uint16 r5 = rgb32To16_R[red];
+                uint16 g5 = rgb32To16_G[green];
+                uint16 b5 = rgb32To16_B[blue];
+
+                dst[c] = b5 | g5 | r5;
             }
         }
+        else {
+            for (int32 c = 0; c < 0x10; ++c)
+                dst[c] = 0;
+        }
+    }
+}
+
 
         uint8 sfxCount = ReadInt8(&info);
         char sfxPath[0x100];
@@ -280,6 +296,7 @@ void RSDK::LoadSceneFolder()
     }
 #endif
 }
+
 void RSDK::LoadSceneAssets()
 {
 #if RETRO_PLATFORM == RETRO_ANDROID
@@ -301,7 +318,6 @@ void RSDK::LoadSceneAssets()
 
     memset(tileLayers, 0, LAYER_COUNT * sizeof(TileLayer));
 
-    // Reload palette
     for (int32 b = 0; b < 8; ++b) {
         for (int32 r = 0; r < 0x10; ++r) {
             if ((activeGlobalRows[b] >> r & 1)) {
@@ -324,52 +340,15 @@ void RSDK::LoadSceneAssets()
             return;
         }
 
-        // Editor Metadata
-
-        // I'm leaving this section here so that the "format" can be documented, since the official code is 3 lines and just skips it lol
-
-        /*
-        uint8 unknown1 = ReadInt8(&info); // usually 3, sometimes 4, LRZ1 (old) is 2
-
-        uint8 b                = ReadInt8(&info);
-        uint8 g                = ReadInt8(&info);
-        uint8 r                = ReadInt8(&info);
-        uint8 a                = ReadInt8(&info);
-        color backgroundColor1 = (a << 24) | (r << 16) | (g << 8) | (b << 0);
-
-        b                      = ReadInt8(&info);
-        g                      = ReadInt8(&info);
-        r                      = ReadInt8(&info);
-        a                      = ReadInt8(&info);
-        color backgroundColor2 = (a << 24) | (r << 16) | (g << 8) | (b << 0);
-
-        uint8 unknown2 = ReadInt8(&info); // always 1 afaik
-        uint8 unknown3 = ReadInt8(&info); // always 1 afaik
-        uint8 unknown4 = ReadInt8(&info); // always 4 afaik
-        uint8 unknown5 = ReadInt8(&info); // always 0 afaik
-        uint8 unknown6 = ReadInt8(&info); // always 1 afaik
-        uint8 unknown7 = ReadInt8(&info); // always 4 afaik
-        uint8 unknown8 = ReadInt8(&info); // always 0 afaik
-
-        char stampName[0x20];
-        ReadString(&info, stampName);
-
-        uint8 unknown9 = ReadInt8(&info); // usually 3, 4, or 5
-        */
-
-        // Skip over Metadata, since we won't be using it at all in-game
         Seek_Cur(&info, 0x10);
         uint8 strLen = ReadInt8(&info);
         Seek_Cur(&info, strLen + 1);
 
-        // Tile Layers
         uint8 layerCount = ReadInt8(&info);
         for (int32 l = 0; l < layerCount; ++l) {
             TileLayer *layer = &tileLayers[l];
-
-            // Tests in RetroED & comparing images of the RSDKv5 editor we have puts this as the most likely use for this (otherwise unused) variable
             bool32 visibleInEditor = ReadInt8(&info) != 0;
-            (void)visibleInEditor; // unused
+            (void)visibleInEditor;
 
             ReadString(&info, textBuffer);
             GEN_HASH_MD5_BUFFER(textBuffer, layer->name);
@@ -404,8 +383,8 @@ void RSDK::LoadSceneAssets()
 
             layer->layout = NULL;
             if (layer->xsize || layer->ysize) {
-                AllocateStorage((void **)&layer->layout, sizeof(uint16) * (1UL << layer->widthShift) * (1UL << layer->heightShift), DATASET_STG, true);
-                memset(layer->layout, 0xFF, sizeof(uint16) * (1UL << layer->widthShift) * (1UL << layer->heightShift));
+                AllocateStorage((void **)&layer->layout, sizeof(uint16) * (1 << layer->widthShift) * (1 << layer->heightShift), DATASET_STG, true);
+                memset(layer->layout, 0xFF, sizeof(uint16) * (1 << layer->widthShift) * (1 << layer->heightShift));
             }
 
             int32 size = layer->xsize;
@@ -420,8 +399,6 @@ void RSDK::LoadSceneAssets()
                 layer->scrollInfo[s].scrollPos      = 0;
                 layer->scrollInfo[s].tilePos        = 0;
                 layer->scrollInfo[s].deform         = ReadInt8(&info);
-
-                // this isn't used anywhere in-engine, and is never set in the files. so as you might expect, no one knows what it is for!
                 layer->scrollInfo[s].unknown = ReadInt8(&info);
             }
 
@@ -450,14 +427,13 @@ void RSDK::LoadSceneAssets()
             tileLayout = NULL;
         }
 
-        // Objects
         uint8 objectCount = ReadInt8(&info);
         editableVarList   = NULL;
         AllocateStorage((void **)&editableVarList, sizeof(EditableVarInfo) * EDITABLEVAR_COUNT, DATASET_TMP, false);
 
 #if RETRO_REV02
-        EntityBase *tempEntityList = NULL;
-        AllocateStorage((void **)&tempEntityList, SCENEENTITY_COUNT * sizeof(EntityBase), DATASET_TMP, true);
+    EntityBase *tempEntityList = NULL;
+    AllocateStorage((void **)&tempEntityList, SCENEENTITY_COUNT * sizeof(EntityBase), DATASET_TMP, true);
 #endif
 
         for (int32 i = 0; i < objectCount; ++i) {
@@ -477,7 +453,7 @@ void RSDK::LoadSceneAssets()
 
 #if !RETRO_USE_ORIGINAL_CODE
             if (!classID && i >= TYPE_DEFAULT_COUNT)
-                PrintLog(PRINT_NORMAL, "Object Class %d is unimplemented!", i);
+                printf("Object Class %d is unimplemented!\n", i);
 #endif
 
             ObjectClass *objectClass = &objectClassList[stageObjectIDs[classID]];
@@ -522,17 +498,73 @@ void RSDK::LoadSceneAssets()
             }
 
             uint16 entityCount = ReadInt16(&info);
+            
+#if !RETRO_USE_ORIGINAL_CODE
+            int32 skippedEntities = 0;
+#endif
+            
             for (int32 e = 0; e < entityCount; ++e) {
                 uint16 slotID = ReadInt16(&info);
-
                 EntityBase *entity = NULL;
 
 #if RETRO_REV02
                 if (slotID < SCENEENTITY_COUNT)
                     entity = &objectEntityList[slotID + RESERVE_ENTITY_COUNT];
-                else
+                else if (slotID < SCENEENTITY_COUNT * 2)
                     entity = &tempEntityList[slotID - SCENEENTITY_COUNT];
+                else {
+#if !RETRO_USE_ORIGINAL_CODE
+                    printf("[PS2] Entity slot %d out of range (max: %d), skipping...\n", 
+                           slotID, SCENEENTITY_COUNT * 2 - 1);
+#endif
+                    int32 dummy_x = ReadInt32(&info, false);
+                    int32 dummy_y = ReadInt32(&info, false);
+                    (void)dummy_x; (void)dummy_y;
+
+                    uint8 tempBuffer[0x10];
+                    for (int32 v = 1; v < varCount; ++v) {
+                        switch (varList[v].type) {
+                            case VAR_UINT8:
+                            case VAR_INT8:
+                                ReadBytes(&info, tempBuffer, sizeof(int8));
+                                break;
+                            case VAR_UINT16:
+                            case VAR_INT16:
+                                ReadBytes(&info, tempBuffer, sizeof(int16));
+                                break;
+                            case VAR_UINT32:
+                            case VAR_INT32:
+                            case VAR_ENUM:
+                            case VAR_BOOL:
+                                ReadBytes(&info, tempBuffer, sizeof(int32));
+                                break;
+                            case VAR_STRING: {
+                                uint16 len = ReadInt16(&info);
+                                Seek_Cur(&info, len * sizeof(uint16));
+                                break;
+                            }
+                            case VAR_VECTOR2:
+                                ReadBytes(&info, tempBuffer, sizeof(int32));
+                                ReadBytes(&info, tempBuffer, sizeof(int32));
+                                break;
+                            case VAR_FLOAT:
+                                ReadBytes(&info, tempBuffer, sizeof(float));
+                                break;
+                            case VAR_COLOR:
+                                ReadBytes(&info, tempBuffer, sizeof(color));
+                                break;
+                        }
+                    }
+                    continue;
+                }
 #else
+                if (slotID >= SCENEENTITY_COUNT) {
+#if !RETRO_USE_ORIGINAL_CODE
+                    printf("[PS2] Entity slot %d out of range, clamping to %d\n", 
+                           slotID, SCENEENTITY_COUNT - 1);
+#endif
+                    slotID = SCENEENTITY_COUNT - 1;
+                }
                 entity = &objectEntityList[slotID + RESERVE_ENTITY_COUNT];
 #endif
 
@@ -562,7 +594,6 @@ void RSDK::LoadSceneAssets()
 #if !RETRO_USE_ORIGINAL_CODE
                                 *(int16 *)&entityBuffer[varList[v].offset] = ReadInt16(&info);
 #else
-                                // This only works as intended on little-endian CPUs.
                                 ReadBytes(&info, &entityBuffer[varList[v].offset], sizeof(int16));
 #endif
                             else
@@ -575,20 +606,17 @@ void RSDK::LoadSceneAssets()
 #if !RETRO_USE_ORIGINAL_CODE
                                 *(int32 *)&entityBuffer[varList[v].offset] = ReadInt32(&info, false);
 #else
-                                // This only works as intended on little-endian CPUs.
                                 ReadBytes(&info, &entityBuffer[varList[v].offset], sizeof(int32));
 #endif
                             else
                                 ReadBytes(&info, tempBuffer, sizeof(int32));
                             break;
 
-                        // not entirely sure on specifics here, should always be sizeof(int32) but it having a unique type implies it isn't always
                         case VAR_ENUM:
                             if (varList[v].active)
 #if !RETRO_USE_ORIGINAL_CODE
                                 *(int32 *)&entityBuffer[varList[v].offset] = ReadInt32(&info, false);
 #else
-                                // This only works as intended on little-endian CPUs.
                                 ReadBytes(&info, &entityBuffer[varList[v].offset], sizeof(int32));
 #endif
                             else
@@ -600,7 +628,6 @@ void RSDK::LoadSceneAssets()
 #if !RETRO_USE_ORIGINAL_CODE
                                 *(bool32 *)&entityBuffer[varList[v].offset] = (bool32)ReadInt32(&info, false);
 #else
-                                // This only works as intended on little-endian CPUs.
                                 ReadBytes(&info, &entityBuffer[varList[v].offset], sizeof(bool32));
 #endif
                             else
@@ -613,7 +640,8 @@ void RSDK::LoadSceneAssets()
                                 uint16 len     = ReadInt16(&info);
 
                                 InitString(string, "", len);
-                                for (string->length = 0; string->length < len; ++string->length) string->chars[string->length] = ReadInt16(&info);
+                                for (string->length = 0; string->length < len; ++string->length) 
+                                    string->chars[string->length] = ReadInt16(&info);
                             }
                             else {
                                 Seek_Cur(&info, ReadInt16(&info) * sizeof(uint16));
@@ -626,24 +654,21 @@ void RSDK::LoadSceneAssets()
                                 *(int32 *)&entityBuffer[varList[v].offset]                 = ReadInt32(&info, false);
                                 *(int32 *)&entityBuffer[varList[v].offset + sizeof(int32)] = ReadInt32(&info, false);
 #else
-                                // This only works as intended on little-endian CPUs.
                                 ReadBytes(&info, &entityBuffer[varList[v].offset], sizeof(int32));
                                 ReadBytes(&info, &entityBuffer[varList[v].offset + sizeof(int32)], sizeof(int32));
 #endif
                             }
                             else {
-                                ReadBytes(&info, tempBuffer, sizeof(int32)); // x
-                                ReadBytes(&info, tempBuffer, sizeof(int32)); // y
+                                ReadBytes(&info, tempBuffer, sizeof(int32));
+                                ReadBytes(&info, tempBuffer, sizeof(int32));
                             }
                             break;
 
-                        // Never used in mania so we don't know for sure, but it's our best guess!
                         case VAR_FLOAT:
                             if (varList[v].active)
 #if !RETRO_USE_ORIGINAL_CODE
                                 *(float *)&entityBuffer[varList[v].offset] = ReadSingle(&info);
 #else
-                                // This only works as intended on little-endian CPUs.
                                 ReadBytes(&info, &entityBuffer[varList[v].offset], sizeof(float));
 #endif
                             else
@@ -655,7 +680,6 @@ void RSDK::LoadSceneAssets()
 #if !RETRO_USE_ORIGINAL_CODE
                                 *(color *)&entityBuffer[varList[v].offset] = ReadInt32(&info, false);
 #else
-                                // This only works as intended on little-endian CPUs.
                                 ReadBytes(&info, &entityBuffer[varList[v].offset], sizeof(color));
 #endif
                             else
@@ -664,6 +688,12 @@ void RSDK::LoadSceneAssets()
                     }
                 }
             }
+            
+#if !RETRO_USE_ORIGINAL_CODE
+            if (skippedEntities > 0) {
+                printf("[PS2] Total entities skipped for this object: %d\n", skippedEntities);
+            }
+#endif
 
 #if !RETRO_USE_ORIGINAL_CODE
             RemoveStorageEntry((void **)&varList);
@@ -692,11 +722,22 @@ void RSDK::LoadSceneAssets()
         }
 
         for (int32 i = 0; i < SCENEENTITY_COUNT; ++i) {
-            if (sceneInfo.filter & tempEntityList[i].filter)
-                memcpy(&objectEntityList[activeSlot++], &tempEntityList[i], sizeof(EntityBase));
-
-            if (activeSlot >= SCENEENTITY_COUNT + RESERVE_ENTITY_COUNT)
-                break;
+            if (tempEntityList[i].classID != 0 && (sceneInfo.filter & tempEntityList[i].filter)) {
+                if (activeSlot < SCENEENTITY_COUNT + RESERVE_ENTITY_COUNT) {
+                    memcpy(&objectEntityList[activeSlot++], &tempEntityList[i], sizeof(EntityBase));
+                }
+                else {
+#if !RETRO_USE_ORIGINAL_CODE
+                    static int32 warnOnce = 0;
+                    if (warnOnce == 0) {
+                        printf("[PS2] WARNING: Scene entity list full at slot %d (max scene entities: %d)\n", 
+                               activeSlot, SCENEENTITY_COUNT);
+                        warnOnce = 1;
+                    }
+#endif
+                    break;
+                }
+            }
         }
 
 #if !RETRO_USE_ORIGINAL_CODE
@@ -712,10 +753,16 @@ void RSDK::LoadSceneAssets()
 
         CloseFile(&info);
     }
+    
 #if RETRO_USE_MOD_LOADER
-    LoadGameXML(true); // override the stage palette *somewhere* idfk
+    LoadGameXML(true);
+#endif
+
+#if !RETRO_USE_ORIGINAL_CODE && RETRO_PLATFORM == RETRO_PS2
+    printf("[PS2] Scene loaded: %d entity slots available\n", ENTITY_COUNT);
 #endif
 }
+
 void RSDK::LoadTileConfig(char *filepath)
 {
     FileInfo info;
@@ -964,17 +1011,27 @@ void RSDK::LoadStageGIF(char *filepath)
         tileset.pixels = tilesetPixels;
         tileset.Load(NULL, false);
 
-        for (int32 r = 0; r < 0x10; ++r) {
-            // only overwrite inactive rows
-            if (!(activeStageRows[0] >> r & 1) && !(activeGlobalRows[0] >> r & 1)) {
-                for (int32 c = 0; c < 0x10; ++c) {
-                    uint8 red                    = (tileset.palette[(r << 4) + c] >> 0x10);
-                    uint8 green                  = (tileset.palette[(r << 4) + c] >> 0x08);
-                    uint8 blue                   = (tileset.palette[(r << 4) + c] >> 0x00);
-                    fullPalette[0][(r << 4) + c] = rgb32To16_B[blue] | rgb32To16_G[green] | rgb32To16_R[red];
-                }
-            }
+for (int32 r = 0; r < 0x10; ++r) {
+
+    if (!(activeStageRows[0] & (1 << r)) && !(activeGlobalRows[0] & (1 << r))) {
+
+        for (int32 c = 0; c < 0x10; ++c) {
+
+            uint32 rgba = tileset.palette[(r << 4) + c];
+
+            uint8 red   = (rgba >> 16) & 0xFF;
+            uint8 green = (rgba >> 8)  & 0xFF;
+            uint8 blue  = (rgba)       & 0xFF;
+
+            uint16 r5 = rgb32To16_R[red];
+            uint16 g5 = rgb32To16_G[green];
+            uint16 b5 = rgb32To16_B[blue];
+
+            fullPalette[0][(r << 4) + c] = b5 | g5 | r5;
         }
+    }
+}
+
 
         // Flip X
         uint8 *srcPixels = tilesetPixels;
@@ -1590,42 +1647,58 @@ void RSDK::DrawLayerRotozoom(TileLayer *layer)
     if (!layer->xsize || !layer->ysize)
         return;
 
-    uint16 *layout         = layer->layout;
-    uint8 *lineBuffer      = &gfxLineBuffer[currentScreen->clipBound_Y1];
+    uint16 *layout = layer->layout;
+    uint8 *lineBuffer = &gfxLineBuffer[currentScreen->clipBound_Y1];
     ScanlineInfo *scanline = &scanlines[currentScreen->clipBound_Y1];
-    uint16 *frameBuffer    = &currentScreen->frameBuffer[currentScreen->clipBound_X1 + currentScreen->clipBound_Y1 * currentScreen->pitch];
+    uint16 *frameBuffer = &currentScreen->frameBuffer[currentScreen->clipBound_X1 + currentScreen->clipBound_Y1 * currentScreen->pitch];
 
-    int32 width    = (TILE_SIZE << layer->widthShift) - 1;
-    int32 height   = (TILE_SIZE << layer->heightShift) - 1;
+    int32 width = (TILE_SIZE << layer->widthShift) - 1;
+    int32 height = (TILE_SIZE << layer->heightShift) - 1;
     int32 lineSize = currentScreen->clipBound_X2 - currentScreen->clipBound_X1;
 
-    for (int32 cy = currentScreen->clipBound_Y1; cy < currentScreen->clipBound_Y2; ++cy) {
+    int32 widthMask = width >> 4;
+    int32 heightMask = height >> 4;
+    int32 widthShift = layer->widthShift;
+
+    for (int32 cy = currentScreen->clipBound_Y1; cy < currentScreen->clipBound_Y2; cy += 2) {
         int32 posX = scanline->position.x;
         int32 posY = scanline->position.y;
-
+        int32 deformX = scanline->deform.x;
+        int32 deformY = scanline->deform.y;
         uint16 *activePalette = fullPalette[*lineBuffer];
-        ++lineBuffer;
-        int32 fbOffset = currentScreen->pitch - lineSize;
+        
+        lineBuffer += 2;
+        scanline += 2;
 
-        for (int32 cx = 0; cx < lineSize; ++cx) {
-            int32 tx = posX >> 20;
-            int32 ty = posY >> 20;
-            int32 x  = FROM_FIXED(posX) & 0xF;
-            int32 y  = FROM_FIXED(posY) & 0xF;
-
-            uint16 tile = layout[((width >> 4) & tx) + (((height >> 4) & ty) << layer->widthShift)] & 0xFFF;
-            uint8 idx   = tilesetPixels[TILE_SIZE * (y + TILE_SIZE * tile) + x];
-
-            if (idx)
-                *frameBuffer = activePalette[idx];
-
-            posX += scanline->deform.x;
-            posY += scanline->deform.y;
-            ++frameBuffer;
+        int32 tempPosX = posX;
+        int32 tempPosY = posY;
+        
+        uint16 *fb1 = frameBuffer;
+        uint16 *fb2 = frameBuffer + currentScreen->pitch;
+        
+        for (int32 cx = 0; cx < lineSize; cx += 2) {
+            int32 tx = (tempPosX >> 20) & widthMask;
+            int32 ty = (tempPosY >> 20) & heightMask;
+            uint16 tile = layout[tx + (ty << widthShift)] & 0xFFF;
+            
+            int32 offset = ((tempPosX >> 16) & 0xF) + (((tempPosY >> 16) & 0xF) << 4);
+            uint8 idx = tilesetPixels[(tile << 8) + offset];
+            
+            if (idx) {
+                uint16 color = activePalette[idx];
+                fb1[0] = color;
+                fb1[1] = color;
+                fb2[0] = color;
+                fb2[1] = color;
+            }
+            
+            tempPosX += deformX * 2; 
+            tempPosY += deformY * 2;
+            fb1 += 2;
+            fb2 += 2;
         }
 
-        frameBuffer += fbOffset;
-        ++scanline;
+        frameBuffer += currentScreen->pitch * 2;
     }
 }
 void RSDK::DrawLayerBasic(TileLayer *layer)
@@ -1652,7 +1725,6 @@ void RSDK::DrawLayerBasic(TileLayer *layer)
         uint16 *frameBuffer = &currentScreen->frameBuffer[currentScreen->clipBound_X1 + currentScreen->clipBound_Y1 * currentScreen->pitch];
         uint16 *layout      = &layer->layout[tx + (ty << layer->widthShift)];
 
-        // Remaining pixels on top
         {
             if (*layout == 0xFFFF) {
                 frameBuffer += TILE_SIZE - sheetX;
