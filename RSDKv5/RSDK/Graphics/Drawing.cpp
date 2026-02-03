@@ -133,6 +133,8 @@ const RenderVertex rsdkVertexBuffer[24] =
 #include "DX9/DX9RenderDevice.cpp"
 #elif RETRO_RENDERDEVICE_DIRECTX11
 #include "DX11/DX11RenderDevice.cpp"
+#elif RETRO_RENDERDEVICE_PS2
+#include "PS2/PS2RenderDevice.cpp"
 #elif RETRO_RENDERDEVICE_SDL2
 #include "SDL2/SDL2RenderDevice.cpp"
 #elif RETRO_RENDERDEVICE_GLFW
@@ -195,30 +197,47 @@ char RSDK::drawGroupNames[0x10][0x10] = {
 #include "RSDK/Dev/DevFont.hpp"
 
 // 50% alpha, but way faster
-#define setPixelBlend(pixel, frameBufferClr) frameBufferClr = ((pixel >> 1) & 0x7BEF) + ((frameBufferClr >> 1) & 0x7BEF)
+#define setPixelBlend(pixel, frameBufferClr) frameBufferClr = ((pixel >> 1) & 0x3DEF) + ((frameBufferClr >> 1) & 0x3DEF)
 
-// Alpha blending
+static inline void setPixelAlpha_func(uint16 pixel, uint16 &frameBufferClr, int32 alpha, const uint16 *fbufferBlend, const uint16 *pixelBlend) {
+    int32 R = fbufferBlend[frameBufferClr & 0x1F] + pixelBlend[pixel & 0x1F];
+    int32 G = (fbufferBlend[(frameBufferClr & 0x3E0) >> 5] + pixelBlend[(pixel & 0x3E0) >> 5]) << 5;
+    int32 B = (fbufferBlend[(frameBufferClr & 0x7C00) >> 10] + pixelBlend[(pixel & 0x7C00) >> 10]) << 10;
+    frameBufferClr = R | G | B;
+}
+
+static inline void setPixelAdditive_func(uint16 pixel, uint16 &frameBufferClr, const uint16 *blendTablePtr) {
+    int32 R = MIN(blendTablePtr[pixel & 0x1F] + (frameBufferClr & 0x1F), 0x1F);
+    int32 G = MIN((blendTablePtr[(pixel & 0x3E0) >> 5] << 5) + (frameBufferClr & 0x3E0), 0x3E0);
+    int32 B = MIN((blendTablePtr[(pixel & 0x7C00) >> 10] << 10) + (frameBufferClr & 0x7C00), 0x7C00);
+    frameBufferClr = R | G | B;
+}
+
+static inline void setPixelSubtractive_func(uint16 pixel, uint16 &frameBufferClr, const uint16 *subBlendTable) {
+    int32 R = MAX((frameBufferClr & 0x1F) - subBlendTable[pixel & 0x1F], 0);
+    int32 G = MAX((frameBufferClr & 0x3E0) - (subBlendTable[(pixel & 0x3E0) >> 5] << 5), 0);
+    int32 B = MAX((frameBufferClr & 0x7C00) - (subBlendTable[(pixel & 0x7C00) >> 10] << 10), 0);
+    frameBufferClr = R | G | B;
+}
+
 #define setPixelAlpha(pixel, frameBufferClr, alpha)                                                                                                  \
-    int32 R = (fbufferBlend[(frameBufferClr & 0xF800) >> 11] + pixelBlend[(pixel & 0xF800) >> 11]) << 11;                                            \
-    int32 G = (fbufferBlend[(frameBufferClr & 0x7E0) >> 6] + pixelBlend[(pixel & 0x7E0) >> 6]) << 6;                                                 \
-    int32 B = fbufferBlend[frameBufferClr & 0x1F] + pixelBlend[pixel & 0x1F];                                                                        \
-                                                                                                                                                     \
+    int32 R = fbufferBlend[frameBufferClr & 0x1F] + pixelBlend[pixel & 0x1F];                                                                        \
+    int32 G = (fbufferBlend[(frameBufferClr & 0x3E0) >> 5] + pixelBlend[(pixel & 0x3E0) >> 5]) << 5;                                                \
+    int32 B = (fbufferBlend[(frameBufferClr & 0x7C00) >> 10] + pixelBlend[(pixel & 0x7C00) >> 10]) << 10;                                           \
     frameBufferClr = R | G | B;
 
 // Additive Blending
 #define setPixelAdditive(pixel, frameBufferClr)                                                                                                      \
-    int32 R = MIN((blendTablePtr[(pixel & 0xF800) >> 11] << 11) + (frameBufferClr & 0xF800), 0xF800);                                                \
-    int32 G = MIN((blendTablePtr[(pixel & 0x7E0) >> 6] << 6) + (frameBufferClr & 0x7E0), 0x7E0);                                                     \
-    int32 B = MIN(blendTablePtr[pixel & 0x1F] + (frameBufferClr & 0x1F), 0x1F);                                                                      \
-                                                                                                                                                     \
+    int32 R = MIN(blendTablePtr[pixel & 0x1F] + (frameBufferClr & 0x1F), 0x1F);                                                                      \
+    int32 G = MIN((blendTablePtr[(pixel & 0x3E0) >> 5] << 5) + (frameBufferClr & 0x3E0), 0x3E0);                                                    \
+    int32 B = MIN((blendTablePtr[(pixel & 0x7C00) >> 10] << 10) + (frameBufferClr & 0x7C00), 0x7C00);                                               \
     frameBufferClr = R | G | B;
 
 // Subtractive Blending
 #define setPixelSubtractive(pixel, frameBufferClr)                                                                                                   \
-    int32 R = MAX((frameBufferClr & 0xF800) - (subBlendTable[(pixel & 0xF800) >> 11] << 11), 0);                                                     \
-    int32 G = MAX((frameBufferClr & 0x7E0) - (subBlendTable[(pixel & 0x7E0) >> 6] << 6), 0);                                                         \
-    int32 B = MAX((frameBufferClr & 0x1F) - subBlendTable[pixel & 0x1F], 0);                                                                         \
-                                                                                                                                                     \
+    int32 R = MAX((frameBufferClr & 0x1F) - subBlendTable[pixel & 0x1F], 0);                                                                         \
+    int32 G = MAX((frameBufferClr & 0x3E0) - (subBlendTable[(pixel & 0x3E0) >> 5] << 5), 0);                                                        \
+    int32 B = MAX((frameBufferClr & 0x7C00) - (subBlendTable[(pixel & 0x7C00) >> 10] << 10), 0);                                                    \
     frameBufferClr = R | G | B;
 
 // Only draw if framebuffer clr IS maskColor
@@ -271,9 +290,11 @@ void RSDK::GenerateBlendLookupTable()
 #endif
 
     for (int32 c = 0; c < 0x100; ++c) {
-        rgb32To16_R[c] = (c & 0xFFF8) << 8;
-        rgb32To16_G[c] = (c & 0xFFFC) << 3;
-        rgb32To16_B[c] = c >> 3;
+        uint8 c5 = c >> 3;  
+        
+        rgb32To16_R[c] = c5;   
+        rgb32To16_G[c] = c5 << 5;   
+        rgb32To16_B[c] = c5 << 10;  
     }
 }
 
@@ -589,28 +610,109 @@ void RSDK::FillScreen(uint32 color, int32 alphaR, int32 alphaG, int32 alphaB)
     alphaG = CLAMP(alphaG, 0x00, 0xFF);
     alphaB = CLAMP(alphaB, 0x00, 0xFF);
 
-    if (alphaR + alphaG + alphaB) {
-        validDraw        = true;
-        uint16 clrBlendR = blendLookupTable[0x20 * alphaR + rgb32To16_B[(color >> 0x10) & 0xFF]];
-        uint16 clrBlendG = blendLookupTable[0x20 * alphaG + rgb32To16_B[(color >> 0x08) & 0xFF]];
-        uint16 clrBlendB = blendLookupTable[0x20 * alphaB + rgb32To16_B[(color >> 0x00) & 0xFF]];
+    if ((alphaR | alphaG | alphaB) == 0) return;
 
-        uint16 *fbBlendR = &blendLookupTable[0x20 * (0xFF - alphaR)];
-        uint16 *fbBlendG = &blendLookupTable[0x20 * (0xFF - alphaG)];
-        uint16 *fbBlendB = &blendLookupTable[0x20 * (0xFF - alphaB)];
+    uint8 srcR8 = (color >> 16) & 0xFF;
+    uint8 srcG8 = (color >> 8) & 0xFF;
+    uint8 srcB8 = color & 0xFF;
 
-        int32 cnt = currentScreen->size.y * currentScreen->pitch;
-        for (int32 id = 0; cnt > 0; --cnt, ++id) {
-            uint16 px = currentScreen->frameBuffer[id];
+    uint16 srcR5 = srcR8 >> 3;
+    uint16 srcG5 = srcG8 >> 3;
+    uint16 srcB5 = srcB8 >> 3;
 
-            int32 R = fbBlendR[(px & 0xF800) >> 11] + clrBlendR;
-            int32 G = fbBlendG[(px & 0x7E0) >> 6] + clrBlendG;
-            int32 B = fbBlendB[px & 0x1F] + clrBlendB;
+    const int32 total = currentScreen->size.y * currentScreen->pitch;
+    uint16 *fb = currentScreen->frameBuffer;
 
-            currentScreen->frameBuffer[id] = (B) | (G << 6) | (R << 11);
+    if (alphaR == 0xFF && alphaG == 0xFF && alphaB == 0xFF) {
+        uint16 fill = (srcB5 << 10) | (srcG5 << 5) | srcR5;
+        
+        #if RETRO_PLATFORM == RETRO_PS2
+        int32 blocks = total >> 3;
+        while (blocks--) {
+            fb[0]=fb[1]=fb[2]=fb[3]=fb[4]=fb[5]=fb[6]=fb[7]=fill;
+            fb += 8;
         }
+        int32 rem = total & 7;
+        while (rem--) *fb++ = fill;
+        #else
+        for (int32 i = 0; i < total; ++i) fb[i] = fill;
+        #endif
+        return;
     }
+
+    if (alphaR < 8 && alphaG < 8 && alphaB < 8) return;
+
+    if (alphaR >= 240 && alphaG >= 240 && alphaB >= 240) {
+        uint16 fill = (srcB5 << 10) | (srcG5 << 5) | srcR5;
+        #if RETRO_PLATFORM == RETRO_PS2
+        int32 blocks = total >> 3;
+        while (blocks--) {
+            fb[0]=fb[1]=fb[2]=fb[3]=fb[4]=fb[5]=fb[6]=fb[7]=fill;
+            fb += 8;
+        }
+        int32 rem = total & 7;
+        while (rem--) *fb++ = fill;
+        #else
+        for (int32 i = 0; i < total; ++i) fb[i] = fill;
+        #endif
+        return;
+    }
+
+    int32 alpha = (alphaR + alphaG + alphaB) / 3;
+    int32 invA = 255 - alpha;
+
+   #if RETRO_PLATFORM == RETRO_PS2
+
+    int32 srcR_scaled = srcR5 * alpha;
+    int32 srcG_scaled = srcG5 * alpha;
+    int32 srcB_scaled = srcB5 * alpha;
+    
+    int32 blocks = total >> 2;
+
+    while (blocks--) {
+
+        uint16 px0 = fb[0];
+        uint16 px1 = fb[1];
+        uint16 px2 = fb[2];
+        uint16 px3 = fb[3];
+
+        int32 r0 = (srcR_scaled + ((px0 & 0x1F) * invA)) >> 8;
+        int32 g0 = (srcG_scaled + (((px0 >> 5) & 0x1F) * invA)) >> 8;
+        int32 b0 = (srcB_scaled + ((px0 >> 10) * invA)) >> 8;
+
+        int32 r1 = (srcR_scaled + ((px1 & 0x1F) * invA)) >> 8;
+        int32 g1 = (srcG_scaled + (((px1 >> 5) & 0x1F) * invA)) >> 8;
+        int32 b1 = (srcB_scaled + ((px1 >> 10) * invA)) >> 8;
+
+        int32 r2 = (srcR_scaled + ((px2 & 0x1F) * invA)) >> 8;
+        int32 g2 = (srcG_scaled + (((px2 >> 5) & 0x1F) * invA)) >> 8;
+        int32 b2 = (srcB_scaled + ((px2 >> 10) * invA)) >> 8;
+
+        int32 r3 = (srcR_scaled + ((px3 & 0x1F) * invA)) >> 8;
+        int32 g3 = (srcG_scaled + (((px3 >> 5) & 0x1F) * invA)) >> 8;
+        int32 b3 = (srcB_scaled + ((px3 >> 10) * invA)) >> 8;
+
+        fb[0] = (b0 << 10) | (g0 << 5) | r0;
+        fb[1] = (b1 << 10) | (g1 << 5) | r1;
+        fb[2] = (b2 << 10) | (g2 << 5) | r2;
+        fb[3] = (b3 << 10) | (g3 << 5) | r3;
+
+        fb += 4;
+    }
+    
+    int32 rem = total & 3;
+    while (rem--) {
+        uint16 px = *fb;
+        int32 r = (srcR_scaled + ((px & 0x1F) * invA)) >> 8;
+        int32 g = (srcG_scaled + (((px >> 5) & 0x1F) * invA)) >> 8;
+        int32 b = (srcB_scaled + ((px >> 10) * invA)) >> 8;
+        *fb++ = (b << 10) | (g << 5) | r;
+    }
+#else
+   
+#endif
 }
+
 
 void RSDK::DrawLine(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative)
 {
@@ -1141,178 +1243,277 @@ void RSDK::DrawLine(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int32 
             break;
     }
 }
-void RSDK::DrawRectangle(int32 x, int32 y, int32 width, int32 height, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative)
+void RSDK::DrawRectangle(int32 x, int32 y, int32 width, int32 height, uint32 color, 
+                         int32 alpha, int32 inkEffect, bool32 screenRelative)
 {
-    switch (inkEffect) {
-        default: break;
-        case INK_ALPHA:
-            if (alpha > 0xFF)
-                inkEffect = INK_NONE;
-            else if (alpha <= 0)
-                return;
-            break;
+    color = ((color&0xFF)<<16)|(color&0xFF00)|((color&0xFF0000)>>16);
 
+    switch (inkEffect) {
+        case INK_ALPHA:
+            if (alpha > 0xFF) inkEffect = INK_NONE;
+            else if (alpha <= 0) return;
+            break;
         case INK_ADD:
         case INK_SUB:
-            if (alpha > 0xFF)
-                alpha = 0xFF;
-            else if (alpha <= 0)
-                return;
+            if (alpha > 0xFF) alpha = 0xFF;
+            else if (alpha <= 0) return;
             break;
-
         case INK_TINT:
-            if (!tintLookupTable)
-                return;
+            if (!tintLookupTable) return;
             break;
     }
 
     if (!screenRelative) {
-        x      = FROM_FIXED(x) - currentScreen->position.x;
-        y      = FROM_FIXED(y) - currentScreen->position.y;
-        width  = FROM_FIXED(width);
+        x = FROM_FIXED(x) - currentScreen->position.x;
+        y = FROM_FIXED(y) - currentScreen->position.y;
+        width = FROM_FIXED(width);
         height = FROM_FIXED(height);
     }
 
-    if (width + x > currentScreen->clipBound_X2)
-        width = currentScreen->clipBound_X2 - x;
-
-    if (x < currentScreen->clipBound_X1) {
-        width += x - currentScreen->clipBound_X1;
-        x = currentScreen->clipBound_X1;
+    int32 clipX1 = currentScreen->clipBound_X1;
+    int32 clipY1 = currentScreen->clipBound_Y1;
+    int32 clipX2 = currentScreen->clipBound_X2;
+    int32 clipY2 = currentScreen->clipBound_Y2;
+    
+    if (x >= clipX2 || y >= clipY2) return;
+    if (x + width <= clipX1 || y + height <= clipY1) return;
+    
+    if (x < clipX1) {
+        width += x - clipX1;
+        x = clipX1;
     }
-
-    if (height + y > currentScreen->clipBound_Y2)
-        height = currentScreen->clipBound_Y2 - y;
-
-    if (y < currentScreen->clipBound_Y1) {
-        height += y - currentScreen->clipBound_Y1;
-        y = currentScreen->clipBound_Y1;
+    if (y < clipY1) {
+        height += y - clipY1;
+        y = clipY1;
     }
+    if (x + width > clipX2) width = clipX2 - x;
+    if (y + height > clipY2) height = clipY2 - y;
 
-    if (width <= 0 || height <= 0)
+    if (width <= 0 || height <= 0) return;
+
+    const int32 pitch = currentScreen->pitch;
+    uint16 *frameBuffer = &currentScreen->frameBuffer[x + (y * pitch)];
+    uint16 color16 = rgb32To16_R[(color >> 0) & 0xFF] | 
+                     rgb32To16_G[(color >> 8) & 0xFF] | 
+                     rgb32To16_B[(color >> 16) & 0xFF];
+    validDraw = true;
+
+    if (inkEffect == INK_NONE) {
+
+        if (width >= 32) {
+            uint16 *fb = frameBuffer;
+            for (int32 h = 0; h < height; h++) {
+                
+                uint16 *line = fb;
+                int32 w16 = width >> 4;
+                while (w16--) {
+                    line[0] = line[1] = line[2] = line[3] = color16;
+                    line[4] = line[5] = line[6] = line[7] = color16;
+                    line[8] = line[9] = line[10] = line[11] = color16;
+                    line[12] = line[13] = line[14] = line[15] = color16;
+                    line += 16;
+                }
+
+                int32 rem = width & 15;
+                int32 w4 = rem >> 2;
+                while (w4--) {
+                    line[0] = line[1] = line[2] = line[3] = color16;
+                    line += 4;
+                }
+                rem &= 3;
+                while (rem--) *line++ = color16;
+                
+                fb += pitch;
+            }
+        } else {
+
+            for (int32 h = 0; h < height; h++) {
+                uint16 *line = frameBuffer;
+                int32 w = width;
+                while (w >= 4) {
+                    line[0] = line[1] = line[2] = line[3] = color16;
+                    line += 4;
+                    w -= 4;
+                }
+                while (w--) *line++ = color16;
+                frameBuffer += pitch;
+            }
+        }
         return;
+    }
 
-    int32 pitch         = currentScreen->pitch - width;
-    validDraw           = true;
-    uint16 *frameBuffer = &currentScreen->frameBuffer[x + (y * currentScreen->pitch)];
-    uint16 color16      = rgb32To16_B[(color >> 0) & 0xFF] | rgb32To16_G[(color >> 8) & 0xFF] | rgb32To16_R[(color >> 16) & 0xFF];
+    if (inkEffect == INK_BLEND) {
+        for (int32 h = 0; h < height; h++) {
+            uint16 *line = frameBuffer;
+            int32 w = width;
 
-    switch (inkEffect) {
-        case INK_NONE: {
-            int32 h = height;
-            while (h--) {
-                int32 w = width;
-                while (w--) {
-                    *frameBuffer = color16;
-                    ++frameBuffer;
-                }
-
-                frameBuffer += pitch;
+            while (w >= 4) {
+                setPixelBlend(color16, line[0]);
+                setPixelBlend(color16, line[1]);
+                setPixelBlend(color16, line[2]);
+                setPixelBlend(color16, line[3]);
+                line += 4;
+                w -= 4;
             }
-            break;
+            while (w--) {
+                setPixelBlend(color16, *line);
+                ++line;
+            }
+            frameBuffer += pitch;
         }
+        return;
+    }
 
-        case INK_BLEND: {
-            int32 h = height;
-            while (h--) {
-                int32 w = width;
-                while (w--) {
-                    setPixelBlend(color16, *frameBuffer);
-                    ++frameBuffer;
-                }
-                frameBuffer += pitch;
+    if (inkEffect == INK_ALPHA) {
+        const uint16 *fbufferBlend = &blendLookupTable[0x20 * (0xFF - alpha)];
+        const uint16 *pixelBlend = &blendLookupTable[0x20 * alpha];
+    
+        for (int32 h = 0; h < height; h++) {
+            uint16 *line = frameBuffer;
+            int32 w = width;
+    
+            while (w >= 4) {
+                setPixelAlpha_func(color16, line[0], alpha, fbufferBlend, pixelBlend);
+                setPixelAlpha_func(color16, line[1], alpha, fbufferBlend, pixelBlend);
+                setPixelAlpha_func(color16, line[2], alpha, fbufferBlend, pixelBlend);
+                setPixelAlpha_func(color16, line[3], alpha, fbufferBlend, pixelBlend);
+                line += 4;
+                w -= 4;
             }
-            break;
+            while (w--) {
+                setPixelAlpha_func(color16, *line, alpha, fbufferBlend, pixelBlend);
+                ++line;
+            }
+            frameBuffer += pitch;
         }
+        return;
+    }
 
-        case INK_ALPHA: {
-            uint16 *fbufferBlend = &blendLookupTable[0x20 * (0xFF - alpha)];
-            uint16 *pixelBlend   = &blendLookupTable[0x20 * alpha];
-
-            int32 h = height;
-            while (h--) {
-                int32 w = width;
-                while (w--) {
-                    setPixelAlpha(color16, *frameBuffer, alpha);
-                    ++frameBuffer;
+    if (inkEffect == INK_ADD) {
+        const uint16 *blendTablePtr = &blendLookupTable[0x20 * alpha];
+        for (int32 h = 0; h < height; h++) {
+            uint16 *line = frameBuffer;
+            int32 w = width;
+            while (w >= 4) {
+               
+                for (int i = 0; i < 4; i++) {
+                    uint16 frameBufferClr = line[i];
+                    int32 R = MIN((blendTablePtr[(color16 & 0xF800) >> 11] << 11) + (frameBufferClr & 0xF800), 0xF800);
+                    int32 G = MIN((blendTablePtr[(color16 & 0x7E0) >> 6] << 6) + (frameBufferClr & 0x7E0), 0x7E0);
+                    int32 B = MIN(blendTablePtr[color16 & 0x1F] + (frameBufferClr & 0x1F), 0x1F);
+                    line[i] = R | G | B;
                 }
-                frameBuffer += pitch;
+                line += 4;
+                w -= 4;
             }
-            break;
+            while (w--) {
+                setPixelAdditive(color16, *line);
+                ++line;
+            }
+            frameBuffer += pitch;
         }
+        return;
+    }
 
-        case INK_ADD: {
-            uint16 *blendTablePtr = &blendLookupTable[0x20 * alpha];
-            int32 h               = height;
-            while (h--) {
-                int32 w = width;
-                while (w--) {
-                    setPixelAdditive(color16, *frameBuffer);
-                    ++frameBuffer;
+    if (inkEffect == INK_SUB) {
+        const uint16 *subBlendTable = &subtractLookupTable[0x20 * alpha];
+        for (int32 h = 0; h < height; h++) {
+            uint16 *line = frameBuffer;
+            int32 w = width;
+            while (w >= 4) {
+
+                for (int i = 0; i < 4; i++) {
+                    uint16 frameBufferClr = line[i];
+                    int32 R = MAX((frameBufferClr & 0xF800) - (subBlendTable[(color16 & 0xF800) >> 11] << 11), 0);
+                    int32 G = MAX((frameBufferClr & 0x7E0) - (subBlendTable[(color16 & 0x7E0) >> 6] << 6), 0);
+                    int32 B = MAX((frameBufferClr & 0x1F) - subBlendTable[color16 & 0x1F], 0);
+                    line[i] = R | G | B;
                 }
-                frameBuffer += pitch;
+                line += 4;
+                w -= 4;
             }
-            break;
+            while (w--) {
+                setPixelSubtractive(color16, *line);
+                ++line;
+            }
+            frameBuffer += pitch;
         }
+        return;
+    }
 
-        case INK_SUB: {
-            uint16 *subBlendTable = &subtractLookupTable[0x20 * alpha];
-            int32 h               = height;
-            while (h--) {
-                int32 w = width;
-                while (w--) {
-                    setPixelSubtractive(color16, *frameBuffer);
-                    ++frameBuffer;
-                }
-                frameBuffer += pitch;
+    if (inkEffect == INK_TINT) {
+        const uint16 *tint = tintLookupTable;
+        for (int32 h = 0; h < height; h++) {
+            uint16 *line = frameBuffer;
+            int32 w = width;
+            while (w >= 8) {
+                line[0] = tint[line[0]];
+                line[1] = tint[line[1]];
+                line[2] = tint[line[2]];
+                line[3] = tint[line[3]];
+                line[4] = tint[line[4]];
+                line[5] = tint[line[5]];
+                line[6] = tint[line[6]];
+                line[7] = tint[line[7]];
+                line += 8;
+                w -= 8;
             }
-            break;
+            while (w--) {
+                *line = tint[*line];
+                ++line;
+            }
+            frameBuffer += pitch;
         }
+        return;
+    }
 
-        case INK_TINT: {
-            int32 h = height;
-            while (h--) {
-                int32 w = width;
-                while (w--) {
-                    *frameBuffer = tintLookupTable[*frameBuffer];
-                    ++frameBuffer;
-                }
-                frameBuffer += pitch;
+    if (inkEffect == INK_MASKED) {
+        const uint16 mask = maskColor;
+        for (int32 h = 0; h < height; h++) {
+            uint16 *line = frameBuffer;
+            int32 w = width;
+            while (w >= 4) {
+                if (line[0] == mask) line[0] = color16;
+                if (line[1] == mask) line[1] = color16;
+                if (line[2] == mask) line[2] = color16;
+                if (line[3] == mask) line[3] = color16;
+                line += 4;
+                w -= 4;
             }
-            break;
+            while (w--) {
+                if (*line == mask) *line = color16;
+                ++line;
+            }
+            frameBuffer += pitch;
         }
+        return;
+    }
 
-        case INK_MASKED: {
-            int32 h = height;
-            while (h--) {
-                int32 w = width;
-                while (w--) {
-                    if (*frameBuffer == maskColor)
-                        *frameBuffer = color16;
-                    ++frameBuffer;
-                }
-                frameBuffer += pitch;
+    if (inkEffect == INK_UNMASKED) {
+        const uint16 mask = maskColor;
+        for (int32 h = 0; h < height; h++) {
+            uint16 *line = frameBuffer;
+            int32 w = width;
+            while (w >= 4) {
+                if (line[0] != mask) line[0] = color16;
+                if (line[1] != mask) line[1] = color16;
+                if (line[2] != mask) line[2] = color16;
+                if (line[3] != mask) line[3] = color16;
+                line += 4;
+                w -= 4;
             }
-            break;
-        }
-
-        case INK_UNMASKED: {
-            int32 h = height;
-            while (h--) {
-                int32 w = width;
-                while (w--) {
-                    if (*frameBuffer != maskColor)
-                        *frameBuffer = color16;
-                    ++frameBuffer;
-                }
-                frameBuffer += pitch;
+            while (w--) {
+                if (*line != mask) *line = color16;
+                ++line;
             }
-            break;
+            frameBuffer += pitch;
         }
     }
 }
+
 void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative)
 {
+    color = ((color&0xFF)<<16)|(color&0xFF00)|((color&0xFF0000)>>16);
     if (radius > 0) {
         switch (inkEffect) {
             default: break;
@@ -1644,6 +1845,7 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
         }
     }
 }
+
 void RSDK::DrawCircleOutline(int32 x, int32 y, int32 innerRadius, int32 outerRadius, uint32 color, int32 alpha, int32 inkEffect,
                              bool32 screenRelative)
 {
@@ -2330,7 +2532,7 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                     }
 
                     for (int32 x = 0; x < count; ++x) {
-                        uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        uint16 color = (startB >> 19) | ((startG >> 14) << 5) | ((startR >> 14) << 10);
                         setPixelBlend(color, frameBuffer[edge->start + x]);
 
                         startR += deltaR;
@@ -2384,7 +2586,7 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                     }
 
                     for (int32 x = 0; x < count; ++x) {
-                        uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        uint16 color = (startB >> 19) | ((startG >> 14) << 5) | ((startR >> 14) << 10);
                         setPixelAlpha(color, frameBuffer[edge->start + x], alpha);
 
                         startR += deltaR;
@@ -2437,7 +2639,7 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                     }
 
                     for (int32 x = 0; x < count; ++x) {
-                        uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        uint16 color = (startB >> 19) | ((startG >> 14) << 5) | ((startR >> 14) << 10);
                         setPixelAdditive(color, frameBuffer[edge->start + x]);
 
                         startR += deltaR;
@@ -2491,7 +2693,7 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                     }
 
                     for (int32 x = 0; x < count; ++x) {
-                        uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        uint16 color = (startB >> 19) | ((startG >> 14) << 5) | ((startR >> 14) << 10);
                         setPixelSubtractive(color, frameBuffer[edge->start + x]);
 
                         startR += deltaR;
@@ -2601,7 +2803,7 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
 
                     for (int32 x = 0; x < count; ++x) {
                         if (frameBuffer[edge->start + x] == maskColor)
-                            frameBuffer[edge->start + x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                            frameBuffer[edge->start + x] = (startB >> 19) | ((startG >> 14) << 5) | ((startR >> 14) << 10);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2614,55 +2816,56 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                 break;
 
             case INK_UNMASKED:
-                for (int32 s = topScreen; s <= bottomScreen; ++s) {
-                    int32 start  = edge->start;
-                    int32 count  = edge->end - edge->start;
-                    int32 deltaR = 0;
-                    int32 deltaG = 0;
-                    int32 deltaB = 0;
-                    if (count > 0) {
-                        deltaR = (edge->endR - edge->startR) / count;
-                        deltaG = (edge->endG - edge->startG) / count;
-                        deltaB = (edge->endB - edge->startB) / count;
-                    }
-                    int32 startR = edge->startR;
-                    int32 startG = edge->startG;
-                    int32 startB = edge->startB;
+    for (int32 s = topScreen; s <= bottomScreen; ++s) {
+        int32 start  = edge->start;
+        int32 count  = edge->end - edge->start;
+        int32 deltaR = 0;
+        int32 deltaG = 0;
+        int32 deltaB = 0;
+        if (count > 0) {
+            deltaR = (edge->endR - edge->startR) / count;
+            deltaG = (edge->endG - edge->startG) / count;
+            deltaB = (edge->endB - edge->startB) / count;
+        }
+        int32 startR = edge->startR;
+        int32 startG = edge->startG;
+        int32 startB = edge->startB;
 
-                    if (start > currentScreen->clipBound_X2) {
-                        edge->start = currentScreen->clipBound_X2;
-                    }
+        if (start > currentScreen->clipBound_X2) {
+            edge->start = currentScreen->clipBound_X2;
+        }
 
-                    if (start < currentScreen->clipBound_X1) {
-                        startR += deltaR * (currentScreen->clipBound_X1 - edge->start);
-                        startG += deltaG * (currentScreen->clipBound_X1 - edge->start);
-                        startB += deltaB * (currentScreen->clipBound_X1 - edge->start);
-                        count -= (currentScreen->clipBound_X1 - edge->start);
-                        edge->start = currentScreen->clipBound_X1;
-                    }
+        if (start < currentScreen->clipBound_X1) {
+            startR += deltaR * (currentScreen->clipBound_X1 - edge->start);
+            startG += deltaG * (currentScreen->clipBound_X1 - edge->start);
+            startB += deltaB * (currentScreen->clipBound_X1 - edge->start);
+            count -= (currentScreen->clipBound_X1 - edge->start);
+            edge->start = currentScreen->clipBound_X1;
+        }
 
-                    if (edge->end < currentScreen->clipBound_X1) {
-                        edge->end = currentScreen->clipBound_X1;
-                    }
+        if (edge->end < currentScreen->clipBound_X1) {
+            edge->end = currentScreen->clipBound_X1;
+        }
 
-                    if (edge->end > currentScreen->clipBound_X2) {
-                        edge->end = currentScreen->clipBound_X2;
-                        count     = currentScreen->clipBound_X2 - edge->start;
-                    }
+        if (edge->end > currentScreen->clipBound_X2) {
+            edge->end = currentScreen->clipBound_X2;
+            count     = currentScreen->clipBound_X2 - edge->start;
+        }
 
-                    for (int32 x = 0; x < count; ++x) {
-                        if (frameBuffer[edge->start + x] != maskColor)
-                            frameBuffer[edge->start + x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+        for (int32 x = 0; x < count; ++x) {
+            if (frameBuffer[edge->start + x] != maskColor)
 
-                        startR += deltaR;
-                        startG += deltaG;
-                        startB += deltaB;
-                    }
+                frameBuffer[edge->start + x] = (startB >> 19) | ((startG >> 14) << 5) | ((startR >> 14) << 10);
+            
+            startR += deltaR;
+            startG += deltaG;
+            startB += deltaB;
+        }
 
-                    ++edge;
-                    frameBuffer += currentScreen->pitch;
-                }
-                break;
+        ++edge;
+        frameBuffer += currentScreen->pitch;
+    }
+    break;
         }
     }
 }

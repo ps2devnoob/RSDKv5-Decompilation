@@ -38,10 +38,14 @@ void RSDK::LoadPalette(uint8 bankID, const char *filename, uint16 disabledRows)
         for (int32 r = 0; r < 0x10; ++r) {
             if (!(disabledRows >> r & 1)) {
                 for (int32 c = 0; c < 0x10; ++c) {
-                    uint8 red                         = ReadInt8(&info);
-                    uint8 green                       = ReadInt8(&info);
-                    uint8 blue                        = ReadInt8(&info);
-                    fullPalette[bankID][(r << 4) + c] = rgb32To16_B[blue] | rgb32To16_G[green] | rgb32To16_R[red];
+                    uint8 red   = ReadInt8(&info);
+                    uint8 green = ReadInt8(&info);
+                    uint8 blue  = ReadInt8(&info);
+                    
+                    fullPalette[bankID][(r << 4) + c] = 
+                        (blue >> 3) |         
+                        ((green >> 3) << 5) |  
+                        ((red >> 3) << 10);    
                 }
             }
             else {
@@ -62,12 +66,14 @@ void RSDK::BlendColors(uint8 destBankID, uint32 *srcColorsA, uint32 *srcColorsB,
 
     uint8 blendA         = 0xFF - blendAmount;
     uint16 *paletteColor = &fullPalette[destBankID][startIndex];
+    
     for (int32 i = startIndex; i < startIndex + count; ++i) {
-        int32 r = blendAmount * ((*srcColorsB >> 0x10) & 0xFF) + blendA * ((*srcColorsA >> 0x10) & 0xFF);
-        int32 g = blendAmount * ((*srcColorsB >> 0x08) & 0xFF) + blendA * ((*srcColorsA >> 0x08) & 0xFF);
-        int32 b = blendAmount * ((*srcColorsB >> 0x00) & 0xFF) + blendA * ((*srcColorsA >> 0x00) & 0xFF);
 
-        *paletteColor = PACK_RGB888((uint8)(r >> 8), (uint8)(g >> 8), (uint8)(b >> 8));
+        int32 r = (blendAmount * ((*srcColorsB >> 0x10) & 0xFF) + blendA * ((*srcColorsA >> 0x10) & 0xFF)) >> 8;
+        int32 g = (blendAmount * ((*srcColorsB >> 0x08) & 0xFF) + blendA * ((*srcColorsA >> 0x08) & 0xFF)) >> 8;
+        int32 b = (blendAmount * ((*srcColorsB >> 0x00) & 0xFF) + blendA * ((*srcColorsA >> 0x00) & 0xFF)) >> 8;
+
+        *paletteColor = (b >> 3) | ((g >> 3) << 5) | ((r >> 3) << 10);
 
         srcColorsA++;
         srcColorsB++;
@@ -89,16 +95,17 @@ void RSDK::SetPaletteFade(uint8 destBankID, uint8 srcBankA, uint8 srcBankB, int1
 
     uint32 blendA        = 0xFF - blendAmount;
     uint16 *paletteColor = &fullPalette[destBankID][startIndex];
+    
     for (int32 i = startIndex; i <= endIndex; ++i) {
         uint32 clrA = GetPaletteEntry(srcBankA, i);
         uint32 clrB = GetPaletteEntry(srcBankB, i);
 
-        int32 r = blendAmount * ((clrB >> 0x10) & 0xFF) + blendA * ((clrA >> 0x10) & 0xFF);
-        int32 g = blendAmount * ((clrB >> 0x08) & 0xFF) + blendA * ((clrA >> 0x08) & 0xFF);
-        int32 b = blendAmount * ((clrB >> 0x00) & 0xFF) + blendA * ((clrA >> 0x00) & 0xFF);
+        int32 r = (blendAmount * ((clrB >> 0x10) & 0xFF) + blendA * ((clrA >> 0x10) & 0xFF)) >> 8;
+        int32 g = (blendAmount * ((clrB >> 0x08) & 0xFF) + blendA * ((clrA >> 0x08) & 0xFF)) >> 8;
+        int32 b = (blendAmount * ((clrB >> 0x00) & 0xFF) + blendA * ((clrA >> 0x00) & 0xFF)) >> 8;
 
-        *paletteColor = PACK_RGB888((uint8)(r >> 8), (uint8)(g >> 8), (uint8)(b >> 8));
-
+        *paletteColor = (b >> 3) | ((g >> 3) << 5) | ((r >> 3) << 10);
+        
         ++paletteColor;
     }
 }

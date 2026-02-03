@@ -6,43 +6,49 @@ using namespace RSDK;
 #include "Legacy/UserStorageLegacy.cpp"
 #endif
 
-// Macro to access the header variables of a block of memory.
-// Note that this is pointless if the pointer is already pointing directly at the header rather than the memory after it.
 #define HEADER(memory, header_value) memory[-HEADER_SIZE + header_value]
 
-// Every block of allocated memory is prefixed with a header that consists of the following four longwords.
 enum {
-    // Whether the block of memory is actually allocated or not.
-    HEADER_ACTIVE,
-    // Which 'data set' this block of memory belongs to.
-    HEADER_SET_ID,
-    // The offset in the buffer which the block of memory begins at.
-    HEADER_DATA_OFFSET,
-    // How long the block of memory is (measured in 'uint32's).
-    HEADER_DATA_LENGTH,
-    // This is not part of the header: it's just a bit of enum magic to calculate the size of the header.
-    HEADER_SIZE
+    HEADER_ACTIVE,      // indicates if the memory block is active
+    HEADER_SET_ID,      // dataset identifier
+    HEADER_DATA_OFFSET, // offset to actual data
+    HEADER_DATA_LENGTH, // length of data in bytes
+    HEADER_SIZE         // total header size
 };
 
 DataStorage RSDK::dataStorage[DATASET_MAX];
 
 bool32 RSDK::InitStorage()
 {
-    // Storage limits.
-    dataStorage[DATASET_STG].storageLimit = 24 * 1024 * 1024; // 24MB
-    dataStorage[DATASET_MUS].storageLimit = 8 * 1024 * 1024;  //  8MB
-    dataStorage[DATASET_SFX].storageLimit = 32 * 1024 * 1024; // 32MB
-    dataStorage[DATASET_STR].storageLimit = 2 * 1024 * 1024;  //  2MB
-    dataStorage[DATASET_TMP].storageLimit = 8 * 1024 * 1024;  //  8MB
-
+    // initialize all storage datasets
     for (int32 s = 0; s < DATASET_MAX; ++s) {
+        dataStorage[s].memoryTable = NULL;
         dataStorage[s].usedStorage = 0;
-        dataStorage[s].entryCount  = 0;
-        dataStorage[s].clearCount  = 0;
-        dataStorage[s].memoryTable = (uint32 *)malloc(dataStorage[s].storageLimit);
+        dataStorage[s].storageLimit = 0;
+        dataStorage[s].entryCount = 0;
+        dataStorage[s].clearCount = 0;
 
-        if (dataStorage[s].memoryTable == NULL)
-            return false;
+        // set memory limits for each dataset type
+        switch (s) {
+            case DATASET_STG:
+                dataStorage[s].storageLimit = (12 * 1024 * 1024) / sizeof(uint32);  // 12mb for stage data
+                break;
+            case DATASET_TMP:
+                dataStorage[s].storageLimit = (3 * 1024 * 1024) / sizeof(uint32);    // 3mb for temporary data
+                break;
+            case DATASET_STR:
+                dataStorage[s].storageLimit = (1 * 1024 * 1024) / sizeof(uint32);    // 1mb for string data
+                break;
+            default:
+                dataStorage[s].storageLimit = (4 * 1024 * 1024) / sizeof(uint32);    // 4mb default
+        }
+        
+        // clear all entry arrays
+        for (int32 e = 0; e < STORAGE_ENTRY_COUNT; ++e) {
+            dataStorage[s].dataEntries[e] = NULL;
+            dataStorage[s].storageEntries[e] = NULL;
+            dataStorage[s].entrySizes[e] = 0;
+        }
     }
 
     return true;
@@ -50,23 +56,42 @@ bool32 RSDK::InitStorage()
 
 void RSDK::ReleaseStorage()
 {
+    // release all datasets and free their memory
     for (int32 s = 0; s < DATASET_MAX; ++s) {
-        if (dataStorage[s].memoryTable != NULL)
-            free(dataStorage[s].memoryTable);
+        // free all entries in this dataset
+        for (int32 e = 0; e < dataStorage[s].entryCount; ++e) {
+            if (dataStorage[s].storageEntries[e] != NULL) {
+                uint32 *data = (uint32 *)dataStorage[s].storageEntries[e];
+                uint32 *header = data - HEADER_SIZE;
+                free(header);
+                
+                // null out the user's pointer if it exists
+                if (dataStorage[s].dataEntries[e] != NULL) {
+                    *dataStorage[s].dataEntries[e] = NULL;
+                }
+            }
+        }
 
+        // reset dataset state
+        dataStorage[s].memoryTable = NULL;
         dataStorage[s].usedStorage = 0;
-        dataStorage[s].entryCount  = 0;
-        dataStorage[s].clearCount  = 0;
+        dataStorage[s].storageLimit = 0;
+        dataStorage[s].entryCount = 0;
+        dataStorage[s].clearCount = 0;
+        
+        // clear all entry arrays
+        for (int32 e = 0; e < STORAGE_ENTRY_COUNT; ++e) {
+            dataStorage[s].dataEntries[e] = NULL;
+            dataStorage[s].storageEntries[e] = NULL;
+            dataStorage[s].entrySizes[e] = 0;
+        }
     }
 
-    // this code isn't in steam executable, since it omits the "load datapack into memory" feature.
-    // I don't think it's in the console versions either, but this never seems to be freed in those versions.
-    // so, I figured doing it here would be the neatest.
 #if !RETRO_USE_ORIGINAL_CODE
+    // free data pack buffers if not using original code
     for (int32 p = 0; p < dataPackCount; ++p) {
         if (dataPacks[p].fileBuffer)
             free(dataPacks[p].fileBuffer);
-
         dataPacks[p].fileBuffer = NULL;
     }
 #endif
@@ -75,285 +100,338 @@ void RSDK::ReleaseStorage()
 void RSDK::AllocateStorage(void **dataPtr, uint32 size, StorageDataSets dataSet, bool32 clear)
 {
     uint32 **data = (uint32 **)dataPtr;
-    *data         = NULL;
+    *data = NULL;
 
-    if ((uint32)dataSet < DATASET_MAX) {
-        // Align allocation to prevent unaligned memory accesses later on.
-        const uint32 size_aligned = size & -(int32)sizeof(void *);
+    // validate dataset index
+    if ((uint32)dataSet >= DATASET_MAX) {
+        return;
+    }
 
-        if (size_aligned < size)
-            size = size_aligned + sizeof(void *);
+    // align size to 4-byte boundary
+    size = (size + 3) & ~3;
+    
+    DataStorage *storage = &dataStorage[dataSet];
 
-        if (dataStorage[dataSet].entryCount < STORAGE_ENTRY_COUNT) {
-            DataStorage *storage = &dataStorage[dataSet];
-
-#if !RETRO_USE_ORIGINAL_CODE
-            // Bug: The original release never takes into account the size of the header when checking if there's enough storage left.
-            // Omitting this will overflow the memory pool when (storageLimit - usedStorage + size) < header size (16 bytes here).
-            if (storage->usedStorage * sizeof(uint32) + size + (HEADER_SIZE * sizeof(uint32)) < storage->storageLimit) {
-#else
-            if (storage->usedStorage * sizeof(uint32) + size < storage->storageLimit) {
-#endif
-                // HEADER_ACTIVE
-                storage->memoryTable[storage->usedStorage] = true;
-                ++storage->usedStorage;
-
-                // HEADER_SET_ID
-                storage->memoryTable[storage->usedStorage] = dataSet;
-                ++storage->usedStorage;
-
-                // HEADER_DATA_OFFSET
-                storage->memoryTable[storage->usedStorage] = storage->usedStorage + HEADER_SIZE - HEADER_DATA_OFFSET;
-                ++storage->usedStorage;
-
-                // HEADER_DATA_LENGTH
-                storage->memoryTable[storage->usedStorage] = size;
-                ++storage->usedStorage;
-
-                *data = &storage->memoryTable[storage->usedStorage];
-                storage->usedStorage += size / sizeof(uint32);
-
-                dataStorage[dataSet].dataEntries[storage->entryCount]    = data;
-                dataStorage[dataSet].storageEntries[storage->entryCount] = *data;
-
-                ++storage->entryCount;
+    // check memory limit
+    uint32 totalSize = (HEADER_SIZE * sizeof(uint32)) + size;
+    uint32 totalSizeInUnits = totalSize / sizeof(uint32);
+    
+    // if not enough space, try garbage collection first
+    if (storage->usedStorage + totalSizeInUnits > storage->storageLimit) {
+        GarbageCollectStorage(dataSet);
+        
+        // if still not enough space, try expanding storage
+        if (storage->usedStorage + totalSizeInUnits > storage->storageLimit) {
+            if (!ExpandStorage(dataSet, totalSize)) {
+                return;
             }
-            else {
-                // We've run out of room, so perform defragmentation and garbage-collection.
-                DefragmentAndGarbageCollectStorage(dataSet);
-
-                // If there is now room, then perform allocation.
-                // Yes, this really is a massive chunk of duplicate code.
-#if !RETRO_USE_ORIGINAL_CODE
-                if (storage->usedStorage * sizeof(uint32) + size + (HEADER_SIZE * sizeof(uint32)) < storage->storageLimit) {
-#else
-                if (storage->usedStorage * sizeof(uint32) + size < storage->storageLimit) {
-#endif
-                    // HEADER_ACTIVE
-                    storage->memoryTable[storage->usedStorage] = true;
-                    ++storage->usedStorage;
-
-                    // HEADER_SET_ID
-                    storage->memoryTable[storage->usedStorage] = dataSet;
-                    ++storage->usedStorage;
-
-                    // HEADER_DATA_OFFSET
-                    storage->memoryTable[storage->usedStorage] = storage->usedStorage + HEADER_SIZE - HEADER_DATA_OFFSET;
-                    ++storage->usedStorage;
-
-                    // HEADER_DATA_LENGTH
-                    storage->memoryTable[storage->usedStorage] = size;
-                    ++storage->usedStorage;
-
-                    *data = &storage->memoryTable[storage->usedStorage];
-                    storage->usedStorage += size / sizeof(uint32);
-
-                    dataStorage[dataSet].dataEntries[storage->entryCount]    = data;
-                    dataStorage[dataSet].storageEntries[storage->entryCount] = *data;
-
-                    ++storage->entryCount;
-                }
-            }
-
-            // If there are too many storage entries, then perform garbage collection.
-            if (storage->entryCount >= STORAGE_ENTRY_COUNT)
-                GarbageCollectStorage(dataSet);
-
-            // Clear the allocated memory if requested.
-            if (*data != NULL && clear == (bool32)true)
-                memset(*data, 0, size);
         }
+    }
+
+    // check entry limit
+    if (storage->entryCount >= STORAGE_ENTRY_COUNT) {
+        GarbageCollectStorage(dataSet);
+        if (storage->entryCount >= STORAGE_ENTRY_COUNT) {
+            return;
+        }
+    }
+
+    // allocate memory with header
+    uint32 *memory = (uint32 *)malloc(totalSize);
+    
+    if (memory == NULL) {
+        return;
+    }
+
+    // setup header information
+    memory[HEADER_ACTIVE] = true;
+    memory[HEADER_SET_ID] = dataSet;
+    memory[HEADER_DATA_OFFSET] = HEADER_SIZE;
+    memory[HEADER_DATA_LENGTH] = size;
+
+    // point to data after header
+    *data = &memory[HEADER_SIZE];
+
+    // clear memory if requested
+    if (clear) {
+        memset(*data, 0, size);
+    }
+
+    // register entry in storage system
+    int32 entryIndex = storage->entryCount;
+    storage->dataEntries[entryIndex] = data;
+    storage->storageEntries[entryIndex] = *data;  // no cast needed, compatible with uint32*
+    storage->entrySizes[entryIndex] = totalSizeInUnits;
+    storage->entryCount++;
+    storage->usedStorage += totalSizeInUnits;
+
+    // run garbage collection if over 75% capacity
+    if ((float)storage->usedStorage / (float)storage->storageLimit > 0.75f) {
+        GarbageCollectStorage(dataSet);
     }
 }
 
 void RSDK::RemoveStorageEntry(void **dataPtr)
 {
-    if (dataPtr != NULL && *dataPtr != NULL) {
-        uint32 *data = *(uint32 **)dataPtr;
-
-        uint32 set = HEADER(data, HEADER_SET_ID);
-        for (int32 e = 0; e < dataStorage[set].entryCount; ++e) {
-#if !RETRO_USE_ORIGINAL_CODE
-            // make sure dataEntries[e] isn't null. If it is null by some ungodly chance then it was prolly already freed or something idk
-            if (dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[e] && *dataPtr == *dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[e]) {
-                *dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[e] = NULL;
-                dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[e]  = NULL;
-            }
-#else
-            if (*dataPtr == *dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[e]) {
-                *dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[e] = NULL;
-                dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[e]  = NULL;
-            }
-#endif
-
-            set = HEADER(data, HEADER_SET_ID);
-        }
-
-        uint32 newEntryCount = 0;
-        set                  = HEADER(data, HEADER_SET_ID);
-        for (uint32 entryID = 0; entryID < dataStorage[set].entryCount; ++entryID) {
-            if (dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[entryID]) {
-                if (entryID != newEntryCount) {
-                    dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[newEntryCount] =
-                        dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[entryID];
-                    dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[entryID] = NULL;
-                    dataStorage[HEADER(data, HEADER_SET_ID)].storageEntries[newEntryCount] =
-                        dataStorage[HEADER(data, HEADER_SET_ID)].storageEntries[entryID];
-                    dataStorage[HEADER(data, HEADER_SET_ID)].storageEntries[entryID] = NULL;
-                }
-
-                ++newEntryCount;
-            }
-
-            set = HEADER(data, HEADER_SET_ID);
-        }
-
-        dataStorage[HEADER(data, HEADER_SET_ID)].entryCount = newEntryCount;
-
-        for (uint32 e = newEntryCount; e < STORAGE_ENTRY_COUNT; ++e) {
-            dataStorage[HEADER(data, HEADER_SET_ID)].dataEntries[e]    = NULL;
-            dataStorage[HEADER(data, HEADER_SET_ID)].storageEntries[e] = NULL;
-        }
-
-        HEADER(data, HEADER_ACTIVE) = false;
+    // validate pointers
+    if (dataPtr == NULL || *dataPtr == NULL) {
+        return;
     }
+
+    // get header and dataset info
+    uint32 *data = *(uint32 **)dataPtr;
+    uint32 *header = data - HEADER_SIZE;
+    uint32 set = header[HEADER_SET_ID];
+    
+    if (set >= DATASET_MAX) {
+        return;
+    }
+
+    DataStorage *storage = &dataStorage[set];
+    
+    // mark as inactive
+    header[HEADER_ACTIVE] = false;
+
+    // find entry in storage list
+    int32 foundIdx = -1;
+    for (int32 e = 0; e < storage->entryCount; ++e) {
+        if (storage->storageEntries[e] == data) {
+            foundIdx = e;
+            break;
+        }
+    }
+
+    // if found, free and remove from list
+    if (foundIdx >= 0) {
+        uint32 dataSize = header[HEADER_DATA_LENGTH];
+        uint32 totalSize = (HEADER_SIZE * sizeof(uint32)) + dataSize;
+        uint32 totalSizeInUnits = totalSize / sizeof(uint32);
+        
+        storage->usedStorage -= totalSizeInUnits;
+        
+        free(header);
+
+        // shift remaining entries down
+        for (int32 e = foundIdx; e < storage->entryCount - 1; ++e) {
+            storage->dataEntries[e] = storage->dataEntries[e + 1];
+            storage->storageEntries[e] = storage->storageEntries[e + 1];
+            storage->entrySizes[e] = storage->entrySizes[e + 1];
+        }
+        
+        // clear last entry
+        storage->entryCount--;
+        storage->dataEntries[storage->entryCount] = NULL;
+        storage->storageEntries[storage->entryCount] = NULL;
+        storage->entrySizes[storage->entryCount] = 0;
+    }
+
+    // null out user's pointer
+    *dataPtr = NULL;
 }
 
-// This defragments the storage, leaving all empty space at the end.
 void RSDK::DefragmentAndGarbageCollectStorage(StorageDataSets set)
 {
-    uint32 processedStorage = 0;
-    uint32 unusedStorage    = 0;
-
-    uint32 *defragmentDestination = dataStorage[set].memoryTable;
-    uint32 *currentHeader         = dataStorage[set].memoryTable;
-
-    ++dataStorage[set].clearCount;
-
-    // Perform garbage-collection. This deallocates all memory allocations that are no longer being used.
+    // currently just calls garbage collection
     GarbageCollectStorage(set);
-
-    // This performs defragmentation. It works by removing 'gaps' between the various blocks of allocated memory,
-    // grouping them all together at the start of the buffer while all the empty space goes at the end.
-    // Avoiding fragmentation is important, as fragmentation can cause allocations to fail despite there being
-    // enough free memory because that free memory isn't contiguous.
-    while (processedStorage < dataStorage[set].usedStorage) {
-        uint32 *dataPtr = &dataStorage[set].memoryTable[currentHeader[HEADER_DATA_OFFSET]];
-        uint32 size     = (currentHeader[HEADER_DATA_LENGTH] / sizeof(uint32)) + HEADER_SIZE;
-
-        // Check if this block of memory is currently allocated.
-        currentHeader[HEADER_ACTIVE] = false;
-
-        for (int32 e = 0; e < dataStorage[set].entryCount; ++e)
-            if (dataPtr == dataStorage[set].storageEntries[e])
-                currentHeader[HEADER_ACTIVE] = true;
-
-        if (currentHeader[HEADER_ACTIVE]) {
-            // This memory is being used.
-            processedStorage += size;
-
-            if (currentHeader > defragmentDestination) {
-                // This memory has a gap before it, so move it backwards into that free space.
-                for (uint32 i = 0; i < size; ++i) *defragmentDestination++ = *currentHeader++;
-            }
-            else {
-                // This memory doesn't have a gap before it, so we don't need to move it - just skip it instead.
-                defragmentDestination += size;
-                currentHeader += size;
-            }
-        }
-        else {
-            // This memory is not being used, so skip it.
-            currentHeader += size;
-            processedStorage += size;
-            unusedStorage += size;
-        }
-    }
-
-    // If defragmentation occurred, then we need to update every single
-    // pointer to allocated memory to point to their new locations in the buffer.
-    if (unusedStorage != 0) {
-        dataStorage[set].usedStorage -= unusedStorage;
-
-        uint32 *currentHeader = dataStorage[set].memoryTable;
-
-        uint32 dataOffset = 0;
-        while (dataOffset < dataStorage[set].usedStorage) {
-            uint32 *dataPtr = &dataStorage[set].memoryTable[currentHeader[HEADER_DATA_OFFSET]];
-            uint32 size     = (currentHeader[HEADER_DATA_LENGTH] / sizeof(uint32)) + HEADER_SIZE; // size (in int32s)
-
-            // Find every single pointer to this memory allocation and update them with its new address.
-            for (int32 c = 0; c < dataStorage[set].entryCount; ++c)
-
-#if !RETRO_USE_ORIGINAL_CODE
-                // make sure dataEntries[e] isn't null. If it is null by some ungodly chance then it was prolly already freed or something idk
-                if (dataPtr == dataStorage[set].storageEntries[c] && dataStorage[set].dataEntries[c])
-                    dataStorage[set].storageEntries[c] = *dataStorage[set].dataEntries[c] = currentHeader + HEADER_SIZE;
-#else
-                if (dataPtr == dataStorage[set].storageEntries[c])
-                    dataStorage[set].storageEntries[c] = *dataStorage[set].dataEntries[c] = currentHeader + HEADER_SIZE;
-#endif
-
-
-            // Update the offset in the allocation's header too.
-            currentHeader[HEADER_DATA_OFFSET] = dataOffset + HEADER_SIZE;
-
-            // Advance to the next memory allocation.
-            currentHeader += size;
-            dataOffset += size;
-        }
-    }
 }
 
 void RSDK::CopyStorage(uint32 **src, uint32 **dst)
 {
-    if (dst != NULL) {
-        uint32 *dstPtr = *dst;
-        *src           = *dst;
+    // validate destination
+    if (dst == NULL || *dst == NULL) {
+        return;
+    }
 
-        if (dataStorage[HEADER(dstPtr, HEADER_SET_ID)].entryCount < STORAGE_ENTRY_COUNT) {
-            dataStorage[HEADER(dstPtr, HEADER_SET_ID)].dataEntries[dataStorage[HEADER(dstPtr, HEADER_SET_ID)].entryCount]    = src;
-            dataStorage[HEADER(dstPtr, HEADER_SET_ID)].storageEntries[dataStorage[HEADER(dstPtr, HEADER_SET_ID)].entryCount] = *src;
+    // get header and dataset info
+    uint32 *dstPtr = *dst;
+    uint32 *header = dstPtr - HEADER_SIZE;
+    uint32 set = header[HEADER_SET_ID];
+    
+    if (set >= DATASET_MAX) {
+        return;
+    }
 
-            ++dataStorage[HEADER(dstPtr, HEADER_SET_ID)].entryCount;
+    DataStorage *storage = &dataStorage[set];
+    
+    // copy pointer
+    *src = *dst;
 
-            if (dataStorage[HEADER(dstPtr, HEADER_SET_ID)].entryCount >= STORAGE_ENTRY_COUNT)
-                GarbageCollectStorage((StorageDataSets)HEADER(dstPtr, HEADER_SET_ID));
-        }
+    // add as new entry if space available
+    if (storage->entryCount < STORAGE_ENTRY_COUNT) {
+        storage->dataEntries[storage->entryCount] = src;
+        storage->storageEntries[storage->entryCount] = *src;
+        storage->entrySizes[storage->entryCount] = (header[HEADER_DATA_LENGTH] + (HEADER_SIZE * sizeof(uint32))) / sizeof(uint32);
+        storage->entryCount++;
     }
 }
 
 void RSDK::GarbageCollectStorage(StorageDataSets set)
 {
-    if ((uint32)set < DATASET_MAX) {
-        for (uint32 e = 0; e < dataStorage[set].entryCount; ++e) {
-            // So what's happening here is the engine is checking to see if the storage entry
-            // (which is the pointer to the "memoryTable" offset that is allocated for this entry)
-            // matches what the actual variable that allocated the storage is currently pointing to.
-            // if they don't match, the storage entry is considered invalid and marked for removal.
+    // validate dataset
+    if ((uint32)set >= DATASET_MAX) {
+        return;
+    }
 
-            if (dataStorage[set].dataEntries[e] != NULL && *dataStorage[set].dataEntries[e] != dataStorage[set].storageEntries[e])
-                dataStorage[set].dataEntries[e] = NULL;
-        }
-
-        uint32 newEntryCount = 0;
-        for (uint32 entryID = 0; entryID < dataStorage[set].entryCount; ++entryID) {
-            if (dataStorage[set].dataEntries[entryID]) {
-                if (entryID != newEntryCount) {
-                    dataStorage[set].dataEntries[newEntryCount]    = dataStorage[set].dataEntries[entryID];
-                    dataStorage[set].dataEntries[entryID]          = NULL;
-                    dataStorage[set].storageEntries[newEntryCount] = dataStorage[set].storageEntries[entryID];
-                    dataStorage[set].storageEntries[entryID]       = NULL;
+    DataStorage *storage = &dataStorage[set];
+    
+    int32 validCount = 0;
+    uint32 freedMemory = 0;
+    
+    // temporary arrays to hold valid entries
+    uint32 **validDataEntries[STORAGE_ENTRY_COUNT];
+    uint32 *validStorageEntries[STORAGE_ENTRY_COUNT];
+    uint32 validEntrySizes[STORAGE_ENTRY_COUNT];
+    
+    // scan all entries and separate valid from invalid
+    for (int32 e = 0; e < storage->entryCount; ++e) {
+        bool32 isValid = false;
+        
+        // check if entry is still valid
+        if (storage->dataEntries[e] != NULL && storage->storageEntries[e] != NULL) {
+            uint32 *userPtr = *storage->dataEntries[e];
+            
+            // verify pointer still points to our storage and header is valid
+            if (userPtr != NULL && userPtr == storage->storageEntries[e]) {
+                uint32 *header = userPtr - HEADER_SIZE;
+                if (header[HEADER_ACTIVE] && header[HEADER_SET_ID] == set) {
+                    isValid = true;
                 }
-
-                ++newEntryCount;
             }
         }
-        dataStorage[set].entryCount = newEntryCount;
-
-        for (int32 e = dataStorage[set].entryCount; e < STORAGE_ENTRY_COUNT; ++e) {
-            dataStorage[set].dataEntries[e]    = NULL;
-            dataStorage[set].storageEntries[e] = NULL;
+        
+        // keep valid entries, free invalid ones
+        if (isValid) {
+            validDataEntries[validCount] = storage->dataEntries[e];
+            validStorageEntries[validCount] = storage->storageEntries[e];
+            validEntrySizes[validCount] = storage->entrySizes[e];
+            validCount++;
+        }
+        else {
+            // free invalid entry
+            if (storage->storageEntries[e] != NULL) {
+                uint32 *data = storage->storageEntries[e];
+                uint32 *header = data - HEADER_SIZE;
+                
+                freedMemory += storage->entrySizes[e];
+                free(header);
+                
+                // null out user pointer if it exists
+                if (storage->dataEntries[e] != NULL) {
+                    *storage->dataEntries[e] = NULL;
+                }
+            }
         }
     }
+    
+    // copy valid entries back to main arrays
+    for (int32 e = 0; e < validCount; ++e) {
+        storage->dataEntries[e] = validDataEntries[e];
+        storage->storageEntries[e] = validStorageEntries[e];
+        storage->entrySizes[e] = validEntrySizes[e];
+    }
+    
+    // clear remaining entries
+    for (int32 e = validCount; e < STORAGE_ENTRY_COUNT; ++e) {
+        storage->dataEntries[e] = NULL;
+        storage->storageEntries[e] = NULL;
+        storage->entrySizes[e] = 0;
+    }
+    
+    // update storage state
+    storage->entryCount = validCount;
+    storage->usedStorage -= freedMemory;
+    storage->clearCount++;
+}
+
+void RSDK::EmergencyStorageCleanup(StorageDataSets set)
+{
+    // validate dataset
+    if ((uint32)set >= DATASET_MAX) {
+        return;
+    }
+    
+    DataStorage *storage = &dataStorage[set];
+    
+    // free all entries
+    for (int32 e = 0; e < storage->entryCount; ++e) {
+        if (storage->storageEntries[e] != NULL) {
+            uint32 *data = storage->storageEntries[e];
+            uint32 *header = data - HEADER_SIZE;
+            free(header);
+            
+            // null out user pointer
+            if (storage->dataEntries[e] != NULL) {
+                *storage->dataEntries[e] = NULL;
+            }
+        }
+    }
+    
+    // reset storage state
+    storage->usedStorage = 0;
+    storage->entryCount = 0;
+    
+    // clear all arrays
+    for (int32 e = 0; e < STORAGE_ENTRY_COUNT; ++e) {
+        storage->dataEntries[e] = NULL;
+        storage->storageEntries[e] = NULL;
+        storage->entrySizes[e] = 0;
+    }
+}
+
+bool32 RSDK::ExpandStorage(StorageDataSets dataSet, uint32 requiredSize)
+{
+    // validate dataset
+    if ((uint32)dataSet >= DATASET_MAX) {
+        return false;
+    }
+    
+    DataStorage *storage = &dataStorage[dataSet];
+    
+    // ps2 has a total 32mb ram limit
+    uint32 maxLimit = (32 * 1024 * 1024) / sizeof(uint32);
+    
+    // try to expand by double the required size
+    uint32 newLimit = storage->storageLimit + (requiredSize / sizeof(uint32)) * 2;
+    
+    // cap at maximum limit
+    if (newLimit > maxLimit) {
+        newLimit = maxLimit;
+    }
+    
+    // check if expansion is possible
+    if (newLimit <= storage->storageLimit) {
+        return false;
+    }
+    
+    storage->storageLimit = newLimit;
+    
+    return true;
+}
+
+// new functions (maintain compatibility)
+void RSDK::SetGCEnabled(bool32 enabled) 
+{
+    // simple implementation placeholder
+}
+
+void RSDK::UpdateStorageGC()
+{
+    static uint32 frameCounter = 0;
+    frameCounter++;
+    
+    // run garbage collection every second (at 60fps)
+    if (frameCounter >= 60) {
+        for (int32 s = 0; s < DATASET_MAX; ++s) {
+            // only gc if there are many entries
+            if (dataStorage[s].entryCount > 10) {
+                GarbageCollectStorage((StorageDataSets)s);
+            }
+        }
+        frameCounter = 0;
+    }
+}
+
+void RSDK::PrintStorageStatus()
+{
+    // implementation removed
 }

@@ -6,16 +6,21 @@ using namespace RSDK;
 #include "Legacy/AudioLegacy.cpp"
 #endif
 
-#define STB_VORBIS_NO_PUSHDATA_API
-#define STB_VORBIS_NO_STDIO
-#define STB_VORBIS_NO_INTEGER_CONVERSION
-#include "stb_vorbis/stb_vorbis.c"
-
-stb_vorbis *vorbisInfo = NULL;
-stb_vorbis_alloc vorbisAlloc;
-
 SFXInfo RSDK::sfxList[SFX_COUNT];
 ChannelInfo RSDK::channels[CHANNEL_COUNT];
+
+typedef struct {
+    FileInfo fileInfo;
+    uint32 dataStartPos;
+    uint32 dataSize;
+    uint32 currentReadPos;
+    uint32 loopPoint;
+    bool isActive;
+    uint16 numChannels;
+    uint32 sampleRate;
+} StreamFileInfo;
+
+static StreamFileInfo activeStream = {0};
 
 char streamFilePath[0x40];
 uint8 *streamBuffer    = NULL;
@@ -23,7 +28,13 @@ int32 streamBufferSize = 0;
 uint32 streamStartPos  = 0;
 int32 streamLoopPoint  = 0;
 
-#define LINEAR_INTERPOLATION_LOOKUP_DIVISOR 0x40 // Determines the 'resolution' of the lookup table.
+#define STREAM_BUFFER_SIZE (64 * 1024)
+#define STREAM_CHUNK_SIZE (16 * 1024)
+
+static uint8 *circularStreamBuffer = NULL;
+
+// determines the 'resolution' of the lookup table
+#define LINEAR_INTERPOLATION_LOOKUP_DIVISOR 0x40
 #define LINEAR_INTERPOLATION_LOOKUP_LENGTH  (TO_FIXED(1) / LINEAR_INTERPOLATION_LOOKUP_DIVISOR)
 
 float linearInterpolationLookup[LINEAR_INTERPOLATION_LOOKUP_LENGTH];
@@ -38,19 +49,36 @@ float linearInterpolationLookup[LINEAR_INTERPOLATION_LOOKUP_LENGTH];
 #include "MiniAudio/MiniAudioDevice.cpp"
 #elif RETRO_AUDIODEVICE_OBOE
 #include "Oboe/OboeAudioDevice.cpp"
+#elif RETRO_AUDIODEVICE_PS2
+#include "PS2/PS2AudioDevice.cpp"
 #endif
 
 uint8 AudioDeviceBase::initializedAudioChannels = false;
 uint8 AudioDeviceBase::audioState               = 0;
 uint8 AudioDeviceBase::audioFocus               = 0;
 
+typedef struct {
+    char riff[4];
+    uint32 fileSize;
+    char wave[4];
+} WAVHeader;
+
+typedef struct {
+    char chunkID[4];
+    uint32 chunkSize;
+} WAVChunk;
+
+typedef struct {
+    uint16 audioFormat;
+    uint16 numChannels;
+    uint32 sampleRate;
+    uint32 byteRate;
+    uint16 blockAlign;
+    uint16 bitsPerSample;
+} WAVFmt;
+
 void AudioDeviceBase::Release()
 {
-    // This is missing, meaning that the garbage collector will never reclaim stb_vorbis's buffer.
-#if !RETRO_USE_ORIGINAL_CODE
-    stb_vorbis_close(vorbisInfo);
-    vorbisInfo = NULL;
-#endif
 }
 
 void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
@@ -68,6 +96,7 @@ void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
             case CHANNEL_IDLE: break;
 
             case CHANNEL_SFX: {
+#if RETRO_PLATFORM != RETRO_PS2
                 SAMPLE_FORMAT *sfxBuffer = &channel->samplePtr[channel->bufferPos];
 
                 float volL = channel->volume, volR = channel->volume;
@@ -82,10 +111,11 @@ void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
                 uint32 speedPercent       = 0;
                 SAMPLE_FORMAT *curStreamF = streamF;
                 while (curStreamF < streamEndF && streamF < streamEndF) {
-                    // Perform linear interpolation.
+                    // perform linear interpolation
                     SAMPLE_FORMAT sample;
 #if !RETRO_USE_ORIGINAL_CODE
-                    if (!sfxBuffer) // PROTECTION FOR v5U (and other mysterious crashes 👻)
+                    // protection for v5u (and other mysterious crashes)
+                    if (!sfxBuffer)
                         sample = 0;
                     else
 #endif
@@ -110,12 +140,11 @@ void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
                         else {
                             channel->bufferPos -= (uint32)channel->sampleLength;
                             channel->bufferPos += channel->loop;
-
                             sfxBuffer = &channel->samplePtr[channel->bufferPos];
                         }
                     }
                 }
-
+#endif
                 break;
             }
 
@@ -138,8 +167,15 @@ void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
                     int32 next = FROM_FIXED(speedPercent);
                     speedPercent %= TO_FIXED(1);
 
+#if RETRO_PLATFORM == RETRO_PS2
+                    int32 left = (int32)curStreamF[0] + (int32)(streamBuffer[0] * panL);
+                    int32 right = (int32)curStreamF[1] + (int32)(streamBuffer[1] * panR);
+                    curStreamF[0] = (int16_t)CLAMP(left, -32768, 32767);
+                    curStreamF[1] = (int16_t)CLAMP(right, -32768, 32767);
+#else
                     curStreamF[0] += streamBuffer[0] * panL;
                     curStreamF[1] += streamBuffer[1] * panR;
+#endif
                     curStreamF += 2;
 
                     streamBuffer += next * 2;
@@ -147,9 +183,7 @@ void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
 
                     if (channel->bufferPos >= channel->sampleLength) {
                         channel->bufferPos -= (uint32)channel->sampleLength;
-
                         streamBuffer = &channel->samplePtr[channel->bufferPos];
-
                         UpdateStreamBuffer(channel);
                     }
                 }
@@ -168,88 +202,184 @@ void AudioDeviceBase::InitAudioChannels()
         channels[i].state   = CHANNEL_IDLE;
     }
 
-    // Compute a lookup table of floating-point linear interpolation delta scales,
-    // to speed-up the process of converting from fixed-point to floating-point.
-    for (int32 i = 0; i < LINEAR_INTERPOLATION_LOOKUP_LENGTH; ++i) linearInterpolationLookup[i] = i / (float)LINEAR_INTERPOLATION_LOOKUP_LENGTH;
+    // compute a lookup table of floating-point linear interpolation delta scales,
+    // to speed-up the process of converting from fixed-point to floating-point
+    for (int32 i = 0; i < LINEAR_INTERPOLATION_LOOKUP_LENGTH; ++i) 
+        linearInterpolationLookup[i] = i / (float)LINEAR_INTERPOLATION_LOOKUP_LENGTH;
 
-    GEN_HASH_MD5("Stream Channel 0", sfxList[SFX_COUNT - 1].hash);
-    sfxList[SFX_COUNT - 1].scope              = SCOPE_GLOBAL;
-    sfxList[SFX_COUNT - 1].maxConcurrentPlays = 1;
-    sfxList[SFX_COUNT - 1].length             = MIX_BUFFER_SIZE;
-    AllocateStorage((void **)&sfxList[SFX_COUNT - 1].buffer, MIX_BUFFER_SIZE * sizeof(SAMPLE_FORMAT), DATASET_MUS, false);
+    #define STREAM_SLOT (SFX_COUNT - 2)
+    
+    GEN_HASH_MD5("Stream Channel 0", sfxList[STREAM_SLOT].hash);
+    sfxList[STREAM_SLOT].scope              = SCOPE_NONE;
+    sfxList[STREAM_SLOT].maxConcurrentPlays = 1;
+    sfxList[STREAM_SLOT].length             = MIX_BUFFER_SIZE;
+    
+    // allocate only the mixing buffer (small, ~20KB)
+    AllocateStorage((void **)&sfxList[STREAM_SLOT].buffer, MIX_BUFFER_SIZE * sizeof(SAMPLE_FORMAT), DATASET_MUS, false);
+    
+    // allocate fixed circular buffer of 64KB for streaming
+    if (!circularStreamBuffer) {
+        AllocateStorage((void **)&circularStreamBuffer, STREAM_BUFFER_SIZE, DATASET_MUS, false);
+    }
+
+    memset(&sfxList[SFX_COUNT - 1], 0, sizeof(SFXInfo));
+    memset(&activeStream, 0, sizeof(StreamFileInfo));
 
     initializedAudioChannels = true;
 }
 
 void RSDK::UpdateStreamBuffer(ChannelInfo *channel)
 {
-    int32 bufferRemaining = MIX_BUFFER_SIZE;
-    float *buffer         = channel->samplePtr;
-
-    for (int32 s = 0; s < MIX_BUFFER_SIZE;) {
-        int32 samples = stb_vorbis_get_samples_float_interleaved(vorbisInfo, 2, buffer, bufferRemaining) * 2;
-        if (!samples) {
-            if (channel->loop == 1 && stb_vorbis_seek_frame(vorbisInfo, streamLoopPoint)) {
-                // we're looping & the seek was successful, get more samples
-            }
-            else {
-                channel->state   = CHANNEL_IDLE;
-                channel->soundID = -1;
-                memset(buffer, 0, sizeof(float) * bufferRemaining);
-
-                break;
-            }
-        }
-
-        s += samples;
-        buffer += samples;
-        bufferRemaining = MIX_BUFFER_SIZE - s;
+#if RETRO_PLATFORM == RETRO_PS2
+    int16_t *buffer = (int16_t *)channel->samplePtr;
+    
+    if (!activeStream.isActive || !circularStreamBuffer) {
+        memset(buffer, 0, MIX_BUFFER_SIZE * sizeof(int16_t));
+        return;
     }
 
-    for (int32 i = 0; i < MIX_BUFFER_SIZE; ++i) channel->samplePtr[i] *= 0.5f;
+    int32 bytesToCopy = MIX_BUFFER_SIZE * sizeof(int16_t);
+    uint32 filePos = activeStream.currentReadPos;
+    
+    if (filePos >= activeStream.dataSize) {
+        if (channel->loop) {
+            // align loop point to stereo sample boundary
+            uint32 alignedLoopPoint = (activeStream.loopPoint / 4) * 4;
+            activeStream.currentReadPos = alignedLoopPoint;
+            filePos = alignedLoopPoint;
+            
+            // clear last samples to avoid clicks
+            if (bytesToCopy >= 16) {
+                int16_t *lastSamples = buffer + (MIX_BUFFER_SIZE - 4);
+                for (int i = 0; i < 4; i++) {
+                    lastSamples[i] = lastSamples[i] / 2; // quick fade
+                }
+            }
+        } else {
+            memset(buffer, 0, bytesToCopy);
+            channel->state = CHANNEL_IDLE;
+            activeStream.isActive = false;
+            CloseFile(&activeStream.fileInfo);
+            return;
+        }
+    }
+    
+    uint32 remaining = activeStream.dataSize - filePos;
+    uint32 toRead = (remaining > bytesToCopy) ? bytesToCopy : remaining;
+    
+    // ensure aligned read
+    toRead = (toRead / 4) * 4;
+    
+    Seek_Set(&activeStream.fileInfo, activeStream.dataStartPos + filePos);
+    ReadBytes(&activeStream.fileInfo, buffer, toRead);
+    
+    if (toRead < bytesToCopy) {
+        memset((uint8*)buffer + toRead, 0, bytesToCopy - toRead);
+    }
+    
+    activeStream.currentReadPos += toRead;
+#endif
 }
 
 void RSDK::LoadStream(ChannelInfo *channel)
 {
-    if (channel->state != CHANNEL_LOADING_STREAM)
-        return;
-
-    stb_vorbis_close(vorbisInfo);
-
-    FileInfo info;
-    InitFileInfo(&info);
-
-    if (LoadFile(&info, streamFilePath, FMODE_RB)) {
-        streamBufferSize = info.fileSize;
-        streamBuffer     = NULL;
-        AllocateStorage((void **)&streamBuffer, info.fileSize, DATASET_MUS, false);
-        ReadBytes(&info, streamBuffer, streamBufferSize);
-        CloseFile(&info);
-
-        if (streamBufferSize > 0) {
-            vorbisAlloc.alloc_buffer_length_in_bytes = 512 * 1024; // 512KiB
-            AllocateStorage((void **)&vorbisAlloc.alloc_buffer, 512 * 1024, DATASET_MUS, false);
-
-            vorbisInfo = stb_vorbis_open_memory(streamBuffer, streamBufferSize, NULL, &vorbisAlloc);
-            if (vorbisInfo) {
-                if (streamStartPos)
-                    stb_vorbis_seek(vorbisInfo, streamStartPos);
-                UpdateStreamBuffer(channel);
-
-                channel->state = CHANNEL_STREAM;
-            }
-        }
+    // clean up previous stream if exists
+    if (activeStream.isActive) {
+        CloseFile(&activeStream.fileInfo);
+        activeStream.isActive = false;
     }
 
-    if (channel->state == CHANNEL_LOADING_STREAM)
+    InitFileInfo(&activeStream.fileInfo);
+
+    if (LoadFile(&activeStream.fileInfo, streamFilePath, FMODE_RB)) {
+        WAVHeader header;
+        ReadBytes(&activeStream.fileInfo, &header, sizeof(WAVHeader));
+
+        if (strncmp(header.riff, "RIFF", 4) != 0 || strncmp(header.wave, "WAVE", 4) != 0) {
+            CloseFile(&activeStream.fileInfo);
+            channel->state = CHANNEL_IDLE;
+            return;
+        }
+
+        WAVFmt fmt = {0};
+        uint32 dataSize = 0;
+        uint32 dataOffset = 0;
+        bool foundFmt = false;
+        bool foundData = false;
+
+        while (!foundData && activeStream.fileInfo.readPos < activeStream.fileInfo.fileSize) {
+            WAVChunk chunk;
+            if (ReadBytes(&activeStream.fileInfo, &chunk, sizeof(WAVChunk)) != sizeof(WAVChunk))
+                break;
+
+            if (strncmp(chunk.chunkID, "fmt ", 4) == 0) {
+                ReadBytes(&activeStream.fileInfo, &fmt, sizeof(WAVFmt));
+                foundFmt = true;
+                
+                uint32 remaining = chunk.chunkSize - sizeof(WAVFmt);
+                if (remaining > 0) {
+                    uint8 skipBuf[256];
+                    while (remaining > 0) {
+                        uint32 toSkip = remaining > 256 ? 256 : remaining;
+                        ReadBytes(&activeStream.fileInfo, skipBuf, toSkip);
+                        remaining -= toSkip;
+                    }
+                }
+            }
+            else if (strncmp(chunk.chunkID, "data", 4) == 0) {
+                dataSize = chunk.chunkSize;
+                dataOffset = activeStream.fileInfo.readPos;
+                foundData = true;
+            }
+            else {
+                uint8 skipBuf[256];
+                uint32 remaining = chunk.chunkSize;
+                while (remaining > 0) {
+                    uint32 toSkip = remaining > 256 ? 256 : remaining;
+                    ReadBytes(&activeStream.fileInfo, skipBuf, toSkip);
+                    remaining -= toSkip;
+                }
+            }
+        }
+
+        if (!foundFmt || !foundData) {
+            CloseFile(&activeStream.fileInfo);
+            channel->state = CHANNEL_IDLE;
+            return;
+        }
+
+        // configure stream information
+        activeStream.dataStartPos = dataOffset;
+        activeStream.dataSize = dataSize;
+        activeStream.currentReadPos = (streamStartPos < dataSize) ? streamStartPos : 0;
+        activeStream.loopPoint = (streamLoopPoint < dataSize) ? streamLoopPoint : 0;
+        activeStream.numChannels = fmt.numChannels;
+        activeStream.sampleRate = fmt.sampleRate;
+        activeStream.isActive = true;
+
+        // load first chunk into circular buffer
+        activeStream.fileInfo.readPos = activeStream.dataStartPos + activeStream.currentReadPos;
+        
+        uint32 initialLoad = (dataSize > STREAM_BUFFER_SIZE) ? STREAM_BUFFER_SIZE : dataSize;
+        memset(circularStreamBuffer, 0, STREAM_BUFFER_SIZE);
+        ReadBytes(&activeStream.fileInfo, circularStreamBuffer, initialLoad);
+        activeStream.currentReadPos += initialLoad;
+
+        UpdateStreamBuffer(channel);
+        channel->state = CHANNEL_STREAM;
+        
+    } else {
         channel->state = CHANNEL_IDLE;
+    }
 }
 
 int32 RSDK::PlayStream(const char *filename, uint32 slot, uint32 startPos, uint32 loopPoint, bool32 loadASync)
 {
-    if (!engine.streamsEnabled)
+    if (!engine.streamsEnabled) {
         return -1;
+    }
 
+    // find available channel
     if (slot >= CHANNEL_COUNT) {
         for (int32 c = 0; c < CHANNEL_COUNT && slot >= CHANNEL_COUNT; ++c) {
             if (channels[c].soundID == -1 && channels[c].state != CHANNEL_LOADING_STREAM) {
@@ -257,8 +387,6 @@ int32 RSDK::PlayStream(const char *filename, uint32 slot, uint32 startPos, uint3
             }
         }
 
-        // as a last resort, run through all channels
-        // pick the channel closest to being finished
         if (slot >= CHANNEL_COUNT) {
             uint32 len = 0xFFFFFFFF;
             for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
@@ -270,27 +398,61 @@ int32 RSDK::PlayStream(const char *filename, uint32 slot, uint32 startPos, uint3
         }
     }
 
-    if (slot >= CHANNEL_COUNT)
+    if (slot >= CHANNEL_COUNT) {
         return -1;
+    }
 
     ChannelInfo *channel = &channels[slot];
 
     LockAudioDevice();
 
+    // stop previous stream if exists
+    if (channel->state == CHANNEL_STREAM || channel->state == CHANNEL_LOADING_STREAM) {
+        if (activeStream.isActive) {
+            CloseFile(&activeStream.fileInfo);
+            activeStream.isActive = false;
+        }
+        channel->state = CHANNEL_IDLE;
+    }
+
+    // clear buffer before starting new stream
+    #define STREAM_SLOT (SFX_COUNT - 2)
+    if (sfxList[STREAM_SLOT].buffer) {
+        memset(sfxList[STREAM_SLOT].buffer, 0, MIX_BUFFER_SIZE * sizeof(SAMPLE_FORMAT));
+    }
+
+    // configure channel
     channel->soundID      = 0xFF;
     channel->loop         = loopPoint != 0;
     channel->priority     = 0xFF;
     channel->state        = CHANNEL_LOADING_STREAM;
     channel->pan          = 0.0f;
     channel->volume       = 1.0f;
-    channel->sampleLength = sfxList[SFX_COUNT - 1].length;
-    channel->samplePtr    = sfxList[SFX_COUNT - 1].buffer;
+    channel->sampleLength = sfxList[STREAM_SLOT].length;
+    channel->samplePtr    = sfxList[STREAM_SLOT].buffer;
     channel->bufferPos    = 0;
-    channel->speed        = TO_FIXED(1);
+    
+#if RETRO_PLATFORM == RETRO_PS2
+    channel->speed = (int32)(0.80f * 65536.0f);
+#else
+    channel->speed = TO_FIXED(1);
+#endif
 
-    sprintf_s(streamFilePath, sizeof(streamFilePath), "Data/Music/%s", filename);
-    streamStartPos  = startPos;
-    streamLoopPoint = loopPoint;
+    // convert .ogg extension to .wav
+    char tempPath[0x40];
+    sprintf_s(tempPath, sizeof(tempPath), "%s", filename);
+    
+    char *ext = strrchr(tempPath, '.');
+    if (ext && strcmp(ext, ".ogg") == 0) {
+        strcpy(ext, ".wav");
+    }
+
+    sprintf_s(streamFilePath, sizeof(streamFilePath), "Data/Music/%s", tempPath);
+    
+    // align positions to stereo sample (4 bytes = L+R in 16-bit)
+    // each stereo sample = 2 channels × 2 bytes = 4 bytes
+    streamStartPos  = (startPos / 4) * 4;
+    streamLoopPoint = (loopPoint / 4) * 4;
 
     AudioDevice::HandleStreamLoad(channel, loadASync);
 
@@ -299,11 +461,45 @@ int32 RSDK::PlayStream(const char *filename, uint32 slot, uint32 startPos, uint3
     return slot;
 }
 
-#define WAV_SIG_HEADER (0x46464952) // RIFF
-#define WAV_SIG_DATA   (0x61746164) // data
-
 void RSDK::LoadSfxToSlot(char *filename, uint8 slot, uint8 plays, uint8 scope)
 {
+#if RETRO_PLATFORM == RETRO_PS2
+    if (sfxList[slot].scope != SCOPE_NONE) {
+        return;
+    }
+
+    RETRO_HASH_MD5(hash);
+    GEN_HASH_MD5(filename, hash);
+
+    HASH_COPY_MD5(sfxList[slot].hash, hash);
+    sfxList[slot].scope = scope;
+    sfxList[slot].maxConcurrentPlays = plays;
+    sfxList[slot].length = 0;
+    sfxList[slot].buffer = NULL;
+    sfxList[slot].playCount = 0;
+    
+    // convert .wav to .adp on ps2
+    char convertedFilename[0x100];
+    strncpy(convertedFilename, filename, sizeof(convertedFilename) - 1);
+    convertedFilename[sizeof(convertedFilename) - 1] = '\0';
+    
+    char *extPos = strrchr(convertedFilename, '.');
+    if (extPos) {
+        char extLower[8];
+        strcpy(extLower, extPos);
+        for (int i = 0; extLower[i]; i++) {
+            extLower[i] = tolower(extLower[i]);
+        }
+        
+        if (strcmp(extLower, ".wav") == 0) {
+            strcpy(extPos, ".adp");
+        }
+    }
+    
+    strncpy(sfxList[slot].fileName, convertedFilename, sizeof(sfxList[slot].fileName) - 1);
+    sfxList[slot].fileName[sizeof(sfxList[slot].fileName) - 1] = '\0';
+
+#else
     FileInfo info;
     InitFileInfo(&info);
 
@@ -317,193 +513,155 @@ void RSDK::LoadSfxToSlot(char *filename, uint8 slot, uint8 plays, uint8 scope)
         HASH_COPY_MD5(sfxList[slot].hash, hash);
         sfxList[slot].scope              = scope;
         sfxList[slot].maxConcurrentPlays = plays;
-
-        uint8 type = fullFilePath[strlen(fullFilePath) - 1];
-        if (type == 'v' || type == 'V') { // A very loose way of checking that we're trying to load a '.wav' file.
-            uint32 signature = ReadInt32(&info, false);
-
-            if (signature == WAV_SIG_HEADER) {
-                ReadInt32(&info, false); // chunk size
-                ReadInt32(&info, false); // WAVE
-                ReadInt32(&info, false); // FMT
-#if !RETRO_USE_ORIGINAL_CODE
-                int32 chunkSize = ReadInt32(&info, false); // chunk size
-#else
-                ReadInt32(&info, false); // chunk size
-#endif
-                ReadInt16(&info);        // audio format
-                ReadInt16(&info);        // channels
-                ReadInt32(&info, false); // sample rate
-                ReadInt32(&info, false); // bytes per sec
-                ReadInt16(&info);        // block align
-                ReadInt16(&info);        // format
-
-                Seek_Set(&info, 34);
-                uint16 sampleBits = ReadInt16(&info);
-
-#if !RETRO_USE_ORIGINAL_CODE
-                // Original code added to help fix some issues
-                Seek_Set(&info, 20 + chunkSize);
-#endif
-
-                // Find the data header
-                int32 loop = 0;
-                while (true) {
-                    signature = ReadInt32(&info, false);
-                    if (signature == WAV_SIG_DATA)
-                        break;
-
-                    loop += 4;
-                    if (loop >= 0x40) {
-                        if (loop != 0x100) {
-                            CloseFile(&info);
-                            // There's a bug here: `sfxList[id].scope` is not reset to `SCOPE_NONE`,
-                            // meaning that the game will consider the SFX valid and allow it to be played.
-                            // This can cause a crash because the SFX is incomplete.
-#if !RETRO_USE_ORIGINAL_CODE
-                            PrintLog(PRINT_ERROR, "Unable to read sfx: %s", filename);
-#endif
-                            return;
-                        }
-                        else {
-                            break;
-                        }
-                    }
-                }
-
-                uint32 length = ReadInt32(&info, false);
-                if (sampleBits == 16)
-                    length /= 2;
-
-                AllocateStorage((void **)&sfxList[slot].buffer, sizeof(float) * length, DATASET_SFX, false);
-                sfxList[slot].length = length;
-
-                // Convert the sample data to F32 format
-                float *buffer = (float *)sfxList[slot].buffer;
-                if (sampleBits == 8) {
-                    // 8-bit sample. Convert from U8 to S8, and then from S8 to F32.
-                    for (int32 s = 0; s < length; ++s) {
-                        int32 sample = ReadInt8(&info);
-                        *buffer++    = (sample - 0x80) / (float)0x80;
-                    }
-                }
-                else {
-                    // 16-bit sample. Convert from S16 to F32.
-                    for (int32 s = 0; s < length; ++s) {
-                        // For some reason, the game performs sign-extension manually here.
-                        // Note that this is different from the 8-bit format's unsigned-to-signed conversion.
-                        int32 sample = (uint16)ReadInt16(&info);
-
-                        if (sample > 0x7FFF)
-                            sample = (sample & 0x7FFF) - 0x8000;
-
-                        *buffer++ = (sample / (float)0x8000) * 0.75f;
-                    }
-                }
-            }
-#if !RETRO_USE_ORIGINAL_CODE
-            else {
-                PrintLog(PRINT_ERROR, "Invalid header in sfx: %s", filename);
-            }
-#endif
-        }
-#if !RETRO_USE_ORIGINAL_CODE
-        else {
-            // what the
-            PrintLog(PRINT_ERROR, "Could not find header in sfx: %s", filename);
-        }
-#endif
     }
-#if !RETRO_USE_ORIGINAL_CODE
-    else {
-        PrintLog(PRINT_ERROR, "Unable to open sfx: %s", filename);
-    }
-#endif
-
     CloseFile(&info);
+#endif
 }
 
 void RSDK::LoadSfx(char *filename, uint8 plays, uint8 scope)
 {
-    // Find an empty sound slot.
-    uint16 id = -1;
-    for (uint32 i = 0; i < SFX_COUNT; ++i) {
+#if RETRO_PLATFORM == RETRO_PS2
+    RETRO_HASH_MD5(newHash);
+    GEN_HASH_MD5(filename, newHash);
+    
+    for (uint32 i = 0; i < SFX_COUNT - 2; ++i) {
+        if (sfxList[i].scope != SCOPE_NONE) {
+            bool match = true;
+            for (int h = 0; h < 16; h++) {
+                if (sfxList[i].hash[h] != newHash[h]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return;
+            }
+        }
+    }
+
+    if (scope == SCOPE_STAGE) {
+        for (uint32 i = 0; i < SFX_COUNT - 2; ++i) {
+            if (sfxList[i].scope == SCOPE_STAGE) {
+#if RETRO_PLATFORM == RETRO_PS2
+                AudioDevice::UnloadADPCM(i);
+#endif
+                memset(&sfxList[i], 0, sizeof(SFXInfo));
+                sfxList[i].scope = SCOPE_NONE;
+            }
+        }
+    }
+
+    uint16 id = (uint16)-1;
+    for (uint32 i = 0; i < SFX_COUNT - 2; ++i) {
         if (sfxList[i].scope == SCOPE_NONE) {
             id = i;
             break;
         }
     }
 
-    if (id != (uint16)-1)
-        LoadSfxToSlot(filename, id, plays, scope);
+    if (id != (uint16)-1) {
+        for (int h = 0; h < 16; h++) {
+            sfxList[id].hash[h] = newHash[h];
+        }
+        
+        sfxList[id].scope = scope;
+        sfxList[id].maxConcurrentPlays = plays;
+        sfxList[id].length = 0;
+        sfxList[id].buffer = NULL;
+        sfxList[id].playCount = 0;
+        
+        // convert .wav to .adp on ps2
+        char convertedFilename[0x100];
+        strncpy(convertedFilename, filename, sizeof(convertedFilename) - 1);
+        convertedFilename[sizeof(convertedFilename) - 1] = '\0';
+        
+        char *extPos = strrchr(convertedFilename, '.');
+        if (extPos) {
+            char extLower[8];
+            strcpy(extLower, extPos);
+            for (int i = 0; extLower[i]; i++) {
+                extLower[i] = tolower(extLower[i]);
+            }
+            
+            if (strcmp(extLower, ".wav") == 0) {
+                strcpy(extPos, ".adp");
+            }
+        }
+        
+        strncpy(sfxList[id].fileName, convertedFilename, sizeof(sfxList[id].fileName) - 1);
+        sfxList[id].fileName[sizeof(sfxList[id].fileName) - 1] = '\0';
+    }
+#else
+    FileInfo info;
+    InitFileInfo(&info);
+
+    char fullFilePath[0x80];
+    sprintf_s(fullFilePath, sizeof(fullFilePath), "Data/SoundFX/%s", filename);
+
+    RETRO_HASH_MD5(hash);
+    GEN_HASH_MD5(filename, hash);
+
+    if (LoadFile(&info, fullFilePath, FMODE_RB)) {
+        HASH_COPY_MD5(sfxList[slot].hash, hash);
+        sfxList[slot].scope              = scope;
+        sfxList[slot].maxConcurrentPlays = plays;
+    }
+    CloseFile(&info);
+#endif
 }
 
 int32 RSDK::PlaySfx(uint16 sfx, uint32 loopPoint, uint32 priority)
 {
-    if (sfx >= SFX_COUNT || !sfxList[sfx].scope)
+#if RETRO_PLATFORM == RETRO_PS2
+    if (sfx == (uint16)-1 || sfx >= SFX_COUNT || sfxList[sfx].scope == SCOPE_NONE) {
         return -1;
+    }
 
-    uint8 count = 0;
     for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
-        if (channels[c].soundID == sfx)
-            ++count;
-    }
-
-    int8 slot = -1;
-    // if we've hit the max, replace the oldest one
-    if (count >= sfxList[sfx].maxConcurrentPlays) {
-        int32 highestStackID = 0;
-        for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
-            int32 stackID = sfxList[sfx].playCount - channels[c].playIndex;
-            if (stackID > highestStackID && channels[c].soundID == sfx) {
-                slot           = c;
-                highestStackID = stackID;
-            }
+        if (channels[c].soundID == sfx) {
+            AudioDevice::StopADPCM(c);
+            channels[c].state = CHANNEL_IDLE;
+            channels[c].soundID = -1;
         }
     }
 
-    // if we don't have a slot yet, try to pick any channel that's not currently playing
-    for (int32 c = 0; c < CHANNEL_COUNT && slot < 0; ++c) {
-        if (channels[c].soundID == -1 && channels[c].state != CHANNEL_LOADING_STREAM) {
-            slot = c;
+    if (!AudioDevice::IsADPCMLoaded(sfx)) {
+        char fullFilePath[0x80];
+        sprintf_s(fullFilePath, sizeof(fullFilePath), "Data/SoundFX/%s", sfxList[sfx].fileName);
+        
+        if (!AudioDevice::LoadADPCM(fullFilePath, sfx)) {
+            return -1;
         }
     }
 
-    // as a last resort, run through all channels
-    // pick the channel closest to being finished AND with lower priority
-    if (slot < 0) {
-        uint32 len = 0xFFFFFFFF;
-        for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
-            if (channels[c].sampleLength < len && priority > channels[c].priority && channels[c].state != CHANNEL_LOADING_STREAM) {
-                slot = c;
-                len  = (uint32)channels[c].sampleLength;
-            }
+    int32 channel = -1;
+    for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
+        if (channels[c].state == CHANNEL_IDLE) {
+            channel = c;
+            break;
         }
     }
 
-    if (slot == -1)
+    if (channel == -1) {
         return -1;
+    }
 
-    LockAudioDevice();
+    int32 audsrvChannel = AudioDevice::PlayADPCM(sfx, loopPoint, priority);
+    
+    if (audsrvChannel >= 0) {
+        channels[channel].soundID = sfx;
+        channels[channel].state = CHANNEL_SFX;
+        channels[channel].priority = priority;
+        channels[channel].playIndex = sfxList[sfx].playCount++;
+        channels[channel].loop = loopPoint;
+        channels[channel].volume = 1.0f;
+        channels[channel].pan = 0.0f;
+    }
 
-    channels[slot].state        = CHANNEL_SFX;
-    channels[slot].bufferPos    = 0;
-    channels[slot].samplePtr    = sfxList[sfx].buffer;
-    channels[slot].sampleLength = sfxList[sfx].length;
-    channels[slot].volume       = 1.0f;
-    channels[slot].pan          = 0.0f;
-    channels[slot].speed        = TO_FIXED(1);
-    channels[slot].soundID      = sfx;
-    if (loopPoint >= 2)
-        channels[slot].loop = loopPoint;
-    else
-        channels[slot].loop = loopPoint - 1;
-    channels[slot].priority  = priority;
-    channels[slot].playIndex = sfxList[sfx].playCount++;
-
-    UnlockAudioDevice();
-
-    return slot;
+    return channel;
+#else
+    return -1;
+#endif
 }
 
 void RSDK::SetChannelAttributes(uint8 channel, float volume, float panning, float speed)
@@ -521,6 +679,15 @@ void RSDK::SetChannelAttributes(uint8 channel, float volume, float panning, floa
             channels[channel].speed = (int32)(speed * TO_FIXED(1));
         else if (speed == 1.0f)
             channels[channel].speed = TO_FIXED(1);
+
+#if RETRO_PLATFORM == RETRO_PS2
+        if (channels[channel].state == CHANNEL_SFX) {
+            int audVolume = (int)(volume * 25.0f);
+            if (audVolume > MAX_VOLUME) audVolume = MAX_VOLUME;
+            
+            int audPan = (int)((panning + 1.0f) * 50.0f);
+        }
+#endif
     }
 }
 
@@ -533,10 +700,7 @@ uint32 RSDK::GetChannelPos(uint32 channel)
         return channels[channel].bufferPos;
 
     if (channels[channel].state == CHANNEL_STREAM) {
-        if (!vorbisInfo->current_loc_valid || vorbisInfo->current_loc < 0)
-            return 0;
-
-        return vorbisInfo->current_loc;
+        return activeStream.currentReadPos;
     }
 
     return 0;
@@ -544,8 +708,8 @@ uint32 RSDK::GetChannelPos(uint32 channel)
 
 double RSDK::GetVideoStreamPos()
 {
-    if (channels[0].state == CHANNEL_STREAM && AudioDevice::audioState && AudioDevice::initializedAudioChannels && vorbisInfo->current_loc_valid) {
-        return vorbisInfo->current_loc / (double)AUDIO_FREQUENCY;
+    if (channels[0].state == CHANNEL_STREAM && AudioDevice::audioState && AudioDevice::initializedAudioChannels) {
+        return activeStream.currentReadPos / (double)(AUDIO_FREQUENCY * 2 * sizeof(int16_t));
     }
 
     return -1.0;
@@ -557,14 +721,20 @@ void RSDK::ClearStageSfx()
 
     for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
         if (channels[c].state == CHANNEL_SFX || channels[c].state == (CHANNEL_SFX | CHANNEL_PAUSED)) {
+#if RETRO_PLATFORM == RETRO_PS2
+            AudioDevice::StopADPCM(c);
+#endif
             channels[c].soundID = -1;
             channels[c].state   = CHANNEL_IDLE;
         }
     }
 
-    // Unload stage SFX
-    for (int32 s = 0; s < SFX_COUNT; ++s) {
+    // unload stage sfx
+    for (int32 s = 0; s < SFX_COUNT - 2; ++s) {
         if (sfxList[s].scope >= SCOPE_STAGE) {
+#if RETRO_PLATFORM == RETRO_PS2
+            AudioDevice::UnloadADPCM(s);
+#endif
             MEM_ZERO(sfxList[s]);
             sfxList[s].scope = SCOPE_NONE;
         }
@@ -580,15 +750,17 @@ void RSDK::ClearGlobalSfx()
 
     for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
         if (channels[c].state == CHANNEL_SFX || channels[c].state == (CHANNEL_SFX | CHANNEL_PAUSED)) {
+#if RETRO_PLATFORM == RETRO_PS2
+            AudioDevice::StopADPCM(c);
+#endif
             channels[c].soundID = -1;
             channels[c].state   = CHANNEL_IDLE;
         }
     }
 
-    // Unload global SFX
-    for (int32 s = 0; s < SFX_COUNT; ++s) {
-        // clear global sfx (do NOT clear the stream channel 0 slot)
-        if (sfxList[s].scope == SCOPE_GLOBAL && s != SFX_COUNT - 1) {
+    // unload global sfx (do not clear the stream channel 0 slot)
+    for (int32 s = 0; s < SFX_COUNT - 2; ++s) {
+        if (sfxList[s].scope == SCOPE_GLOBAL) {
             MEM_ZERO(sfxList[s]);
             sfxList[s].scope = SCOPE_NONE;
         }

@@ -1,6 +1,139 @@
 #include "RSDK/Core/RetroEngine.hpp"
 #include "main.hpp"
 
+
+#ifdef __ps2__
+#include <reent.h>
+#include <kernel.h>
+#include <malloc.h>
+#include <stdbool.h>
+#include <time.h>
+#include <tamtypes.h>
+#include <stdio.h>
+
+typedef struct {
+    size_t binary_size;
+    size_t allocs_size;
+    size_t stack_size;
+} AthenaMemory;
+
+static AthenaMemory prog_mem;
+static bool memory_monitor_enabled = true; 
+static int frame_counter = 0;
+
+
+void *malloc(size_t size) {
+    void* raw_ptr = _malloc_r(_REENT, size);
+    if (raw_ptr) {
+        size_t* ptr = (size_t*)raw_ptr;
+        prog_mem.allocs_size += ptr[-1];
+    }
+    return raw_ptr;
+}
+
+void *realloc(void *memblock, size_t size) {
+    if (memblock) {
+        size_t* ptr = (size_t*)memblock;
+        prog_mem.allocs_size -= ptr[-1];
+    }
+    
+    void* raw_ptr = _realloc_r(_REENT, memblock, size);
+    
+    if (raw_ptr) {
+        size_t* ptr = (size_t*)raw_ptr;
+        prog_mem.allocs_size += ptr[-1];
+    }
+    return raw_ptr;
+}
+
+void *calloc(size_t number, size_t size) {
+    void* raw_ptr = _calloc_r(_REENT, number, size);
+    if (raw_ptr) {
+        size_t* ptr = (size_t*)raw_ptr;
+        prog_mem.allocs_size += ptr[-1];
+    }
+    return raw_ptr;
+}
+
+void *memalign(size_t alignment, size_t size) {
+    void* raw_ptr = _memalign_r(_REENT, alignment, size);
+    if (raw_ptr) {
+        size_t* ptr = (size_t*)raw_ptr;
+        prog_mem.allocs_size += ptr[-1];
+    }
+    return raw_ptr;
+}
+
+void free(void* ptr) {
+    if (ptr) {
+        size_t* size_ptr = (size_t*)ptr;
+        prog_mem.allocs_size -= size_ptr[-1];
+    }
+    _free_r(_REENT, ptr);
+}
+
+void init_memory_manager() {
+    extern char _end[], __start[];
+    prog_mem.binary_size = (size_t)&_end - (size_t)&__start;
+    prog_mem.stack_size = 0x20000;
+    prog_mem.allocs_size = 0;
+    frame_counter = 0;
+}
+
+size_t get_binary_size() { return prog_mem.binary_size; }
+size_t get_allocs_size() { return prog_mem.allocs_size; }
+size_t get_stack_size() { return prog_mem.stack_size; }
+size_t get_used_memory() { 
+    return prog_mem.stack_size + prog_mem.allocs_size + prog_mem.binary_size; 
+}
+
+
+void format_memory_size(size_t bytes, char *buffer) {
+    if (bytes < 1024) {
+        sprintf(buffer, "%zu B", bytes);
+    } else if (bytes < 1024 * 1024) {
+        sprintf(buffer, "%.2f KB", bytes / 1024.0f);
+    } else {
+        sprintf(buffer, "%.2f MB", bytes / (1024.0f * 1024.0f));
+    }
+}
+
+
+void print_memory_report() {
+    char binary_str[32], allocs_str[32], stack_str[32], total_str[32];
+    
+    format_memory_size(prog_mem.binary_size, binary_str);
+    format_memory_size(prog_mem.allocs_size, allocs_str);
+    format_memory_size(prog_mem.stack_size, stack_str);
+    format_memory_size(get_used_memory(), total_str);
+
+}
+
+
+extern "C" void update_memory_monitor_frame() {
+    frame_counter++;
+    
+    if (!memory_monitor_enabled) return;
+    
+    
+    if (frame_counter % 180 == 0) {
+        print_memory_report();
+    }
+}
+
+
+void set_memory_monitor(bool enabled) {
+    memory_monitor_enabled = enabled;
+
+}
+
+bool is_memory_monitor_enabled() {
+    return memory_monitor_enabled;
+}
+
+
+#endif
+
 #if RETRO_STANDALONE
 #define LinkGameLogic RSDK::LinkGameLogic
 #else
@@ -40,7 +173,6 @@ void android_main(struct android_app *ap)
     app->activity->callbacks->onKeyUp   = AndroidKeyUpCallback;
 
     JNISetup *jni = GetJNISetup();
-    // we make sure we do it here so init can chill safely before any callbacks occur
     Paddleboat_init(jni->env, jni->thiz);
 
     SwappyGL_init(jni->env, jni->thiz);
@@ -75,7 +207,15 @@ void android_main(struct android_app *ap)
     SwappyGL_destroy();
 }
 #else
-int32 main(int32 argc, char *argv[]) { return RSDK_main(argc, argv, (void *)LinkGameLogic); }
+
+int32 main(int32 argc, char *argv[]) { 
+#ifdef __ps2__
+    init_memory_manager();
+
+#endif
+    
+    return RSDK_main(argc, argv, (void *)LinkGameLogic); 
+}
 #endif
 
 int32 RSDK_main(int32 argc, char **argv, void *linkLogicPtr)

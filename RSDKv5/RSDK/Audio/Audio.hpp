@@ -8,22 +8,27 @@ namespace RSDK
 #define CHANNEL_COUNT (0x10)
 
 #define MIX_BUFFER_SIZE (0x800)
+#if RETRO_PLATFORM == RETRO_PS2 
+#define SAMPLE_FORMAT   int16
+#else
 #define SAMPLE_FORMAT   float
+#endif
 
 #define AUDIO_FREQUENCY (44100)
 #define AUDIO_CHANNELS  (2)
 
 struct SFXInfo {
     RETRO_HASH_MD5(hash);
-    float *buffer;
+    SAMPLE_FORMAT *buffer;
     size_t length;
     int32 playCount;
     uint8 maxConcurrentPlays;
     uint8 scope;
+    char fileName[0x100]; // Add this line
 };
 
 struct ChannelInfo {
-    float *samplePtr;
+    SAMPLE_FORMAT *samplePtr;
     float pan;
     float volume;
     int32 speed;
@@ -80,6 +85,8 @@ void LoadSfx(char *filePath, uint8 plays, uint8 scope);
 #include "SDL2/SDL2AudioDevice.hpp"
 #elif RETRO_AUDIODEVICE_OBOE
 #include "Oboe/OboeAudioDevice.hpp"
+#elif RETRO_AUDIODEVICE_PS2
+#include "PS2/PS2AudioDevice.hpp"
 #endif
 
 namespace RSDK

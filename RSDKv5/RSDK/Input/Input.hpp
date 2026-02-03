@@ -50,15 +50,15 @@ enum InputDeviceAPIs {
     DEVICE_API_RAWINPUT,
     DEVICE_API_STEAM,
 
-// CUSTOM APIs
+
 #if RETRO_INPUTDEVICE_SDL2
-    DEVICE_API_SDL2, // custom-made for SDL2 API, afaik it's not in original RSDKv5 (since it could be in a mac-version, but I do not have that so...)
+    DEVICE_API_SDL2, 
 #endif
 #if RETRO_INPUTDEVICE_GLFW
-    DEVICE_API_GLFW, // custom-made for OGL, won't be in ANY real RSDKv5 version ever, it's just cool
+    DEVICE_API_GLFW, 
 #endif
 #if RETRO_INPUTDEVICE_PDBOAT
-    DEVICE_API_PDBOAT // custom-made for android (paddleboat API)
+    DEVICE_API_PDBOAT 
 #endif
 };
 
@@ -398,7 +398,7 @@ struct ControllerState {
     InputState keyStart;
     InputState keySelect;
 
-    // Rev01 hasn't split these into different structs yet
+    
 #if !RETRO_REV02
     InputState keyBumperL;
     InputState keyBumperR;
@@ -504,15 +504,19 @@ extern int32 gamePadCount;
 #include "Paddleboat/PDBInputDevice.hpp"
 #endif
 
-// Initializes the input devices & the backend APIs powering em
+#if RETRO_INPUTDEVICE_PS2
+#include "PS2/PS2InputDevice.hpp"
+#endif
+
+
 void InitInputDevices();
-// clears the input states, used by ProcessInput()
+
 void ClearInput();
-// Processes the state of the input devices & parses that as data that RSDK can use
+
 void ProcessInput();
-// used to process various events on input devices, switch uses it to controller connects/disconnects/changes
+
 void ProcessInputDevices();
-// Releases the input devices & closes the backend APIs powering em
+
 void ReleaseInputDevices();
 
 void RemoveInputDevice(InputDevice *targetDevice);
@@ -647,7 +651,7 @@ inline int32 GetInputDeviceUnknown(uint32 deviceID)
 {
     for (int32 i = 0; i < inputDeviceCount; ++i) {
         if (inputDeviceList[i] && inputDeviceList[i]->id == deviceID) {
-            return 0xFFFF; // ???
+            return 0xFFFF; 
         }
     }
 
@@ -764,7 +768,7 @@ inline void ResetInputSlotAssignments()
 
 inline void SetInputLEDColor()
 {
-    // empty
+    
 }
 
 #if !RETRO_REV02
@@ -776,13 +780,13 @@ inline void GetUnknownInputValue(int32 inputSlot, int32 type, int32 *value)
         switch (type) {
             default:
                 break;
-                // case 0: *value = inputSlotDevices[slotID].unknown1; break;
-                // case 1: *value = inputSlotDevices[slotID].unknown2; break;
+                
+                
         }
     }
 }
 #endif
 
-} // namespace RSDK
+} 
 
-#endif // !INPUT_H
+#endif 
